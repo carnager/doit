@@ -1,6 +1,5 @@
 # How doit works
 
-
 ## Why
 
 rofi/dmenu speak *strings*. Everything is a line, metadata gets smuggled
