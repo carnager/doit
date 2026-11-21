@@ -1,0 +1,13 @@
+#!/bin/sh
+# doit provider: session/power menu (static, structured items).
+#   [[provider]]
+#   name = "power"
+#   exec = "~/.config/doit/providers/power"
+#   prefix = "!"
+cat <<'JSON'
+{"title":"Lock","icon":"system-lock-screen","exec":"loginctl lock-session","keywords":["screen"]}
+{"title":"Suspend","icon":"system-suspend","exec":"systemctl suspend","keywords":["sleep"]}
+{"title":"Log out","icon":"system-log-out","exec":"niri msg action quit --skip-confirmation","keywords":["exit","quit"]}
+{"title":"Reboot","icon":"system-reboot","exec":"systemctl reboot","keywords":["restart"]}
+{"title":"Shut down","icon":"system-shutdown","exec":"systemctl poweroff","keywords":["poweroff","halt"]}
+JSON

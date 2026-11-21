@@ -1,0 +1,31 @@
+# midnight — the default doit theme. Deep ink with a periwinkle accent.
+font = "Inter"
+font_size = 15
+subtext_size = 12.5
+input_size = 19
+width = 680
+rows = 8
+row_height = 52
+radius = 20
+row_radius = 12
+padding = 10
+icon_size = 32
+shadow_size = 28
+
+[colors]
+background        = "#14151bf2"
+border            = "#ffffff1a"
+shadow            = "#00000080"
+text              = "#e8e9f0"
+subtext           = "#8b8ea3"
+placeholder       = "#5d6075"
+accent            = "#8b9cff"
+caret             = "#8b9cff"
+selection         = "#8b9cff26"
+selection_text    = "#ffffff"
+selection_subtext = "#b4b9d6"
+match_text        = "#a9b6ff"
+separator         = "#ffffff12"
+badge             = "#ffffff10"
+badge_text        = "#8b8ea3"
+hint              = "#5d6075"

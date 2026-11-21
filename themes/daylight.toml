@@ -1,0 +1,20 @@
+# daylight — crisp light theme.
+font = "Inter"
+
+[colors]
+background        = "#fbfbfdf5"
+border            = "#0000001a"
+shadow            = "#00000038"
+text              = "#1b1c22"
+subtext           = "#6b6e80"
+placeholder       = "#a3a6b8"
+accent            = "#4c5fd7"
+caret             = "#4c5fd7"
+selection         = "#4c5fd71f"
+selection_text    = "#10121c"
+selection_subtext = "#4d5170"
+match_text        = "#3a4cc4"
+separator         = "#0000000f"
+badge             = "#0000000a"
+badge_text        = "#6b6e80"
+hint              = "#a3a6b8"

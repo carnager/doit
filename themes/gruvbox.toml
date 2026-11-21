@@ -1,0 +1,23 @@
+# gruvbox — warm retro groove.
+font = "Inter"
+radius = 10
+row_radius = 6
+selection_bar = false
+
+[colors]
+background        = "#282828f5"
+border            = "#504945"
+shadow            = "#00000070"
+text              = "#ebdbb2"
+subtext           = "#a89984"
+placeholder       = "#7c6f64"
+accent            = "#fabd2f"
+caret             = "#fabd2f"
+selection         = "#fabd2f24"
+selection_text    = "#fbf1c7"
+selection_subtext = "#d5c4a1"
+match_text        = "#fabd2f"
+separator         = "#3c3836"
+badge             = "#3c3836"
+badge_text        = "#a89984"
+hint              = "#7c6f64"

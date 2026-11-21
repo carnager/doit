@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""doit live provider: calculator. Enter copies the result.
+
+  [[provider]]
+  name = "calc"
+  exec = "~/.config/doit/providers/calc"
+  prefix = "="
+  live = true
+"""
+import json, math, sys
+
+ALLOWED = {k: getattr(math, k) for k in dir(math) if not k.startswith("_")}
+ALLOWED.update(abs=abs, round=round, min=min, max=max)
+
+def evaluate(expr):
+    expr = expr.replace("^", "**").replace("×", "*").replace("÷", "/").replace(",", ".")
+    code = compile(expr, "<calc>", "eval")
+    for name in code.co_names:
+        if name not in ALLOWED:
+            raise NameError(name)
+    return eval(code, {"__builtins__": {}}, ALLOWED)
+
+def fmt(v):
+    if isinstance(v, float):
+        if v.is_integer() and abs(v) < 1e16:
+            return str(int(v))
+        return f"{v:.12g}"
+    return str(v)
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+emit({"placeholder": "Type an expression…"})
+for line in sys.stdin:
+    q = json.loads(line).get("query", "").strip()
+    if not q:
+        emit({"items": []})
+        continue
+    try:
+        r = fmt(evaluate(q))
+        emit({"items": [{
+            "title": r,
+            "subtitle": f"{q} =",
+            "icon": "accessories-calculator",
+            "exec": f"printf %s {json.dumps(r)} | wl-copy",
+            "badge": "copy",
+        }]})
+    except Exception:
+        emit({"items": [{"title": "…", "subtitle": "incomplete expression", "icon": "accessories-calculator"}]})

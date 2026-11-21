@@ -1,0 +1,22 @@
+# nord — arctic, north-bluish.
+font = "Inter"
+radius = 14
+row_radius = 8
+
+[colors]
+background        = "#2e3440f5"
+border            = "#4c566a"
+shadow            = "#00000070"
+text              = "#eceff4"
+subtext           = "#a3abba"
+placeholder       = "#616e88"
+accent            = "#88c0d0"
+caret             = "#88c0d0"
+selection         = "#88c0d02e"
+selection_text    = "#eceff4"
+selection_subtext = "#d8dee9"
+match_text        = "#8fbcbb"
+separator         = "#3b4252"
+badge             = "#3b4252"
+badge_text        = "#a3abba"
+hint              = "#616e88"

@@ -1,0 +1,596 @@
+#!/usr/bin/env python3
+"""doit mode for a Cinnamon (Popcorn) media server.
+
+  popcorn               the poster grid: continue watching first, then new
+                        episodes, your watchlist, recent additions, then every
+                        show and movie. Type to search all of them.
+  a show                Enter opens its episodes; the first row is the next
+                        one to watch. Backspace on the pill goes back.
+
+  Enter                 play (resuming where you stopped)
+  Tab                   play from start · trailer · play on a TV ·
+                        mark watched · watchlist
+
+Playback runs in mpv and reports progress to the server, so resume points,
+"continue watching" and watched marks stay in sync with the TV and phone apps.
+
+Config: ~/.config/doit/popcorn.toml (server, username, password); falls back
+to popcorn-mpv's ~/.config/popcorn/mpv.toml.
+
+  [[provider]]
+  name = "popcorn"
+  exec = "~/.config/doit/providers/popcorn"
+  prefix = "v "
+
+Standalone, in a wide window:  popcorn --launch
+"""
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
+
+HOME = os.path.expanduser("~")
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or f"{HOME}/.config", "doit", "popcorn.toml")
+LEGACY = os.path.join(os.environ.get("XDG_CONFIG_HOME") or f"{HOME}/.config", "popcorn", "mpv.toml")
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or f"{HOME}/.cache", "doit", "popcorn")
+SEP = " › "
+
+
+# ── server ───────────────────────────────────────────────────────────────────
+
+def load_config():
+    cfg = {}
+    for path in (LEGACY, CONFIG):  # doit's own config wins
+        try:
+            with open(path, "rb") as fh:
+                cfg.update({k: v for k, v in tomllib.load(fh).items() if v})
+        except (OSError, tomllib.TOMLDecodeError):
+            pass
+    cfg.setdefault("server", "http://localhost:8097")
+    cfg["server"] = cfg["server"].rstrip("/")
+    return cfg
+
+
+class Api:
+    def __init__(self):
+        self.cfg = load_config()
+        self.server = self.cfg["server"]
+        self.token_file = os.path.join(CACHE, "token")
+        try:
+            with open(self.token_file) as fh:
+                self.token = fh.read().strip()
+        except OSError:
+            self.token = self.cfg.get("token", "")
+        self.lock = threading.Lock()
+
+    def login(self):
+        if not self.cfg.get("password"):
+            raise RuntimeError(f"not logged in: put username and password in {CONFIG}")
+        out = self._raw("POST", "/api/auth/login",
+                        {"username": self.cfg.get("username", ""), "password": self.cfg["password"]}, auth=False)
+        self.token = out["token"]
+        os.makedirs(CACHE, exist_ok=True)
+        fd = os.open(self.token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(self.token)
+
+    def _raw(self, method, path, body=None, auth=True, raw=False):
+        headers = {"Content-Type": "application/json"}
+        if auth and self.token:
+            headers["Authorization"] = "Bearer " + self.token
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(self.server + path, data=data, method=method, headers=headers)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            payload = r.read()
+        if raw:
+            return payload
+        return json.loads(payload) if payload.strip() else None
+
+    def call(self, method, path, body=None, raw=False):
+        try:
+            return self._raw(method, path, body, raw=raw)
+        except urllib.error.HTTPError as e:
+            if e.code != 401:
+                raise
+            with self.lock:
+                self.login()
+            return self._raw(method, path, body, raw=raw)
+
+    def get(self, path):
+        return self.call("GET", path)
+
+
+# ── playback (runs detached, outlives doit) ──────────────────────────────────
+
+def finished(pos, dur):
+    return dur > 0 and pos > 0 and (dur - pos <= 90_000 or pos * 100 >= dur * 92)
+
+
+def mpv_query(sock_path, prop):
+    try:
+        s = socket.socket(socket.AF_UNIX)
+        s.settimeout(1)
+        s.connect(sock_path)
+        s.sendall((json.dumps({"command": ["get_property", prop]}) + "\n").encode())
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        s.close()
+        for line in buf.splitlines():
+            msg = json.loads(line)
+            if "data" in msg and msg.get("error") == "success":
+                return msg["data"]
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def play(item_id, from_start=False):
+    api = Api()
+    item = api.get(f"/api/items/{item_id}")
+    try:
+        prog = api.get(f"/api/items/{item_id}/progress") or {}
+    except urllib.error.HTTPError:
+        prog = {}
+    pos, dur = prog.get("positionMs") or 0, prog.get("durationMs") or item.get("durationMs") or 0
+    start = 0 if from_start or prog.get("completed") or pos < 60_000 else pos // 1000
+
+    def save(state, completed=False, continuous=0):
+        try:
+            api.call("PUT", f"/api/items/{item_id}/progress", {
+                "positionMs": int(pos), "durationMs": int(dur), "completed": completed,
+                "state": state, "continuousMs": int(continuous)})
+        except (urllib.error.URLError, OSError, RuntimeError):
+            pass
+
+    if from_start:
+        pos = 0
+    save("start")
+    sock_path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), f"doit-popcorn-{item_id}.sock")
+    title = item.get("title") or "Popcorn"
+    args = ["mpv", f"--force-media-title={title}", f"--input-ipc-server={sock_path}",
+            f"--http-header-fields=Authorization: Bearer {api.token}"]
+    if start:
+        args.append(f"--start={start}")
+    args.append(f"{api.server}/api/items/{item_id}/stream")
+    proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    continuous, last = 0, pos
+    while True:
+        try:
+            proc.wait(timeout=15)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        p = mpv_query(sock_path, "playback-time")
+        d = mpv_query(sock_path, "duration")
+        if d:
+            dur = int(d * 1000)
+        if p is not None:
+            pos = int(p * 1000)
+            delta = pos - last
+            continuous = continuous + delta if 0 <= delta <= 22_000 else 0
+            last = pos
+            save("play", continuous=continuous)
+    done = finished(pos, dur)
+    if done:
+        pos = dur
+    save("stop", completed=done, continuous=continuous)
+    try:
+        os.unlink(sock_path)
+    except OSError:
+        pass
+
+
+def play_trailer(item_id):
+    api = Api()
+    url = f"{api.server}/api/items/{item_id}/trailer"
+    try:
+        req = urllib.request.Request(url, method="HEAD", headers={"Authorization": "Bearer " + api.token})
+        urllib.request.urlopen(req, timeout=10).close()
+    except urllib.error.HTTPError:
+        subprocess.run(["notify-send", "-a", "Popcorn", "No trailer for this one"], check=False)
+        return
+    subprocess.run(["mpv", f"--http-header-fields=Authorization: Bearer {api.token}", url],
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def detach(*args):
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), *args], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+# ── formatting ───────────────────────────────────────────────────────────────
+
+def genres(it):
+    """The server sends genres as one string ("Drama, Horror"); accept a list too."""
+    g = it.get("genres") or []
+    return [x.strip() for x in g.split(",") if x.strip()] if isinstance(g, str) else list(g)
+
+
+def runtime(ms):
+    m = int(ms or 0) // 60000
+    return f"{m // 60}h {m % 60:02}m" if m >= 60 else f"{m} min"
+
+
+def epcode(it):
+    return f"S{it.get('seasonNumber') or 0:02}E{it.get('episodeNumber') or 0:02}"
+
+
+# ── the mode ─────────────────────────────────────────────────────────────────
+
+class Provider:
+    def __init__(self):
+        self.api = Api()
+        self.lock = threading.Lock()
+        self.lib = self.load_cache()  # home, movies, shows, devices, new
+        self.view = None
+        self.show_cache = {}  # show title -> episodes
+        os.makedirs(os.path.join(CACHE, "posters"), exist_ok=True)
+
+    # data
+    def load_cache(self):
+        try:
+            with open(os.path.join(CACHE, "library.json")) as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None
+
+    def refresh(self):
+        """Fetch everything in parallel; re-show the current view when done."""
+        out, threads = {}, []
+        paths = {"home": "/api/home", "movies": "/api/items?libraryId=movies&limit=100000&sort=title",
+                 "shows": "/api/tv/shows?libraryId=tv_shows&limit=100000&sort=title",
+                 "devices": "/api/devices", "new": "/api/shows/new-episodes"}
+
+        def fetch(key, path):
+            try:
+                out[key] = self.api.get(path)
+            except Exception as e:  # noqa: BLE001 - shown to the user below
+                out[key + "_error"] = str(e)
+
+        for k, p in paths.items():
+            t = threading.Thread(target=fetch, args=(k, p))
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+        if "home" not in out or "movies" not in out:
+            if self.lib is None:
+                err = out.get("home_error") or out.get("movies_error")
+                self.emit({"items": [{"title": "Can't reach the Popcorn server", "subtitle": err,
+                                      "icon": "dialog-error", "sticky": True}]})
+            return
+        lib = {
+            "home": {"sections": out["home"].get("sections", []), "progress": out["home"].get("progress", []),
+                     "showProgress": out["home"].get("showProgress", []),
+                     "watchlist": out["home"].get("watchlist", {})},
+            "movies": [slim(m) for m in out["movies"]],
+            "shows": [slim(s) for s in out.get("shows", [])],
+            "devices": out.get("devices", []),
+            "new": out.get("new", []),
+        }
+        for sec in lib["home"]["sections"]:
+            sec["items"] = [slim(i) for i in sec.get("items") or []]
+            sec.pop("entries", None)
+        with self.lock:
+            self.lib = lib
+            self.show_cache.clear()
+        try:
+            tmp = os.path.join(CACHE, "library.json.tmp")
+            with open(tmp, "w") as fh:
+                json.dump(lib, fh)
+            os.replace(tmp, os.path.join(CACHE, "library.json"))
+        except OSError:
+            pass
+        self.redraw()
+        if self.fetch_show_posters():
+            self.redraw()  # with the posters that just arrived
+
+    def fetch_show_posters(self):
+        """Download missing show posters, 8 at a time. True if any arrived."""
+        from concurrent.futures import ThreadPoolExecutor
+        todo = [s for s in self.lib["shows"] if s.get("posterItemId") and not os.path.exists(self.show_poster_path(s))]
+
+        def one(s):
+            try:
+                data = self.api.call("GET", f"/api/items/{s['posterItemId']}/image/poster", raw=True)
+                tmp = self.show_poster_path(s) + ".tmp"
+                with open(tmp, "wb") as fh:
+                    fh.write(data)
+                os.replace(tmp, self.show_poster_path(s))
+                return True
+            except Exception:  # noqa: BLE001 - a missing poster just shows a tile
+                return False
+
+        with ThreadPoolExecutor(8) as pool:
+            return any(list(pool.map(one, todo)))
+
+    @staticmethod
+    def show_poster_path(s):
+        return os.path.join(CACHE, "posters", f"show-{s.get('posterItemId')}-{s.get('posterMtimeUnix', 0)}.jpg")
+
+    def progress(self):
+        return {p["itemId"]: p for p in self.lib["home"].get("progress", [])}
+
+    def section(self, kind):
+        return next((s.get("items") or [] for s in self.lib["home"]["sections"] if s.get("type") == kind), [])
+
+    # icons
+    @staticmethod
+    def local(path):
+        return path if path and os.path.exists(path) else None
+
+    def poster_for_show(self, title):
+        s = next((s for s in self.lib["shows"] if s["title"] == title), None)
+        p = self.show_poster_path(s) if s else None
+        return p if p and os.path.exists(p) else "video-x-generic"
+
+    # items
+    def actions(self, it, prog):
+        acts = []
+        if prog and (prog.get("positionMs") or 0) > 60_000 and not prog.get("completed"):
+            acts.append({"title": "Play from start", "id": "start", "icon": "media-skip-backward"})
+        if it.get("kind") == "movie":
+            acts.append({"title": "Play trailer", "id": "trailer", "icon": "media-playback-start"})
+        for d in self.lib.get("devices") or []:
+            acts.append({"title": f"Play on {d['name']}", "id": "tv:" + d["id"], "icon": "video-display"})
+        watched = bool(prog and prog.get("completed"))
+        acts.append({"title": "Mark unwatched" if watched else "Mark watched", "id": "unwatched" if watched else "watched",
+                     "icon": "object-select", "keep_open": True})
+        if it.get("kind") == "movie":
+            listed = any(w.get("id") == it["id"] for w in self.lib["home"].get("watchlist", {}).get("items") or [])
+            acts.append({"title": "Remove from watchlist" if listed else "Add to watchlist",
+                         "id": "wl-del" if listed else "wl-add", "icon": "bookmark-new", "keep_open": True})
+        return acts
+
+    def movie(self, m, prog_map, badge=None):
+        prog = prog_map.get(m["id"])
+        bits = [str(m.get("year") or ""), ", ".join(genres(m)[:2]), runtime(m.get("durationMs"))]
+        if m.get("rating"):
+            bits.append(f"★ {m['rating']:.1f}")
+        return {
+            "id": f"mv:{m['id']}", "title": m["title"], "subtitle": " · ".join(b for b in bits if b),
+            "icon": self.local(m.get("posterPath")) or "video-x-generic",
+            "keywords": [m.get("originalTitle") or "", str(m.get("year") or ""), "movie", *genres(m),
+                         *(m.get("directors") if isinstance(m.get("directors"), list) else [m.get("directors") or ""])],
+            "progress": self.fraction(prog), "badge": badge, "verb": self.verb(prog),
+            "actions": self.actions(m, prog),
+        }
+
+    def episode(self, e, prog_map, badge=None, in_show=False):
+        prog = prog_map.get(e["id"])
+        code = epcode(e)
+        name = e.get("episodeTitle") or e.get("title")
+        status = "watched ✓" if prog and prog.get("completed") else (
+            f"{runtime((prog.get('durationMs') or 0) - (prog.get('positionMs') or 0))} left"
+            if self.fraction(prog) else runtime(e.get("durationMs")))
+        item = {
+            "id": f"ep:{e['id']}", "progress": self.fraction(prog), "badge": badge, "verb": self.verb(prog),
+            "actions": self.actions(e, prog) + ([] if in_show else [
+                {"title": "Browse episodes…", "id": "browse", "icon": "view-list",
+                 "set_query": e.get("showTitle", "") + SEP}]),
+        }
+        if in_show:
+            item.update(title=f"{code} · {name}", subtitle=f"Season {e.get('seasonNumber')} · {status}",
+                        icon=self.local(e.get("backdropPath")) or self.local(e.get("posterPath")) or "video-x-generic")
+        else:
+            item.update(title=f"{e.get('showTitle')} · {code}", subtitle=f"{name} · {status}",
+                        icon=self.local(e.get("posterPath")) or self.poster_for_show(e.get("showTitle")),
+                        keywords=[e.get("showTitle", ""), name or "", "tv"])
+        return item
+
+    def show(self, s, badge=None):
+        sp = next((p for p in self.lib["home"].get("showProgress", []) if p.get("showTitle") == s["title"]), None)
+        done = f" · {sp['completedCount']}/{sp['episodeCount']} watched" if sp and sp.get("hasAnyCompletion") else ""
+        return {
+            "id": f"show:{s['title']}", "title": s["title"],
+            "subtitle": f"{s.get('year') or ''} · {s.get('seasonCount')} seasons · {s.get('episodeCount')} episodes{done}",
+            "icon": self.poster_for_show(s["title"]),
+            "keywords": [s.get("originalTitle") or "", str(s.get("year") or ""), "tv", "show", *genres(s)],
+            "progress": (sp["completedCount"] / sp["episodeCount"]) if sp and sp.get("episodeCount") and not sp.get("completed") and sp.get("hasAnyCompletion") else None,
+            "badge": badge, "verb": "Episodes", "set_query": s["title"] + SEP,
+            "actions": [{"title": "Play next episode", "id": "next", "icon": "media-playback-start"}] + [
+                {"title": f"Play next episode on {d['name']}", "id": "tv:" + d["id"], "icon": "video-display"}
+                for d in self.lib.get("devices") or []],
+        }
+
+    @staticmethod
+    def fraction(prog):
+        if not prog or prog.get("completed") or not prog.get("durationMs") or (prog.get("positionMs") or 0) < 60_000:
+            return None
+        return min(1.0, prog["positionMs"] / prog["durationMs"])
+
+    @staticmethod
+    def verb(prog):
+        return "Resume" if Provider.fraction(prog) else "Play"
+
+    def home_items(self):
+        pm, items, seen = self.progress(), [], set()
+
+        def add(it):
+            if it["id"] not in seen:
+                seen.add(it["id"])
+                items.append(it)
+
+        cont = [(i, "episode") for i in self.section("continue_tv")] + [(i, "movie") for i in self.section("continue_movies")]
+        cont.sort(key=lambda x: (pm.get(x[0]["id"]) or {}).get("updatedAt") or "", reverse=True)
+        for it, kind in cont:
+            add(self.episode(it, pm, "continue") if kind == "episode" else self.movie(it, pm, "continue"))
+        shows = {s["title"]: s for s in self.lib["shows"]}
+        for n in self.lib.get("new") or []:
+            if n.get("showTitle") in shows:
+                add(self.show(shows[n["showTitle"]], badge=f"{n['count']} new"))
+        wl = self.lib["home"].get("watchlist", {})
+        for m in wl.get("items") or []:
+            add(self.movie(slim(m), pm, "watchlist"))
+        for m in self.section("recent_movies"):
+            add(self.movie(m, pm, "new"))
+        for s in self.lib["shows"]:
+            add(self.show(s))
+        for m in self.lib["movies"]:
+            add(self.movie(m, pm))
+        return items
+
+    def episodes(self, title):
+        if title not in self.show_cache:
+            q = "libraryId=tv_shows&showTitle=" + urllib.parse.quote(title)
+            eps = []
+            for season in self.api.get("/api/tv/seasons?" + q) or []:
+                sid = season.get("id", season.get("seasonNumber"))
+                eps += [slim(e) for e in self.api.get(f"/api/tv/episodes?{q}&season={sid}") or []]
+            eps.sort(key=lambda e: (e.get("seasonNumber") or 0, e.get("episodeNumber") or 0))
+            self.show_cache[title] = eps
+        return self.show_cache[title]
+
+    def next_up(self, title):
+        cont = next((i for i in self.section("continue_tv") if i.get("showTitle") == title), None)
+        if cont:
+            return cont
+        eps, pm = self.episodes(title), self.progress()
+        last_done = max((i for i, e in enumerate(eps) if (pm.get(e["id"]) or {}).get("completed")), default=-1)
+        for e in eps[last_done + 1:] + eps:
+            if not (pm.get(e["id"]) or {}).get("completed"):
+                return e
+        return eps[0] if eps else None
+
+    def show_items(self, title):
+        pm, eps = self.progress(), self.episodes(title)
+        items = []
+        nxt = self.next_up(title)
+        if nxt:
+            first = self.episode(nxt, pm, "next", in_show=True)
+            first.update(id=f"ep:{nxt['id']}", title=f"Up next: {first['title']}", sticky=True)
+            items.append(first)
+        items += [self.episode(e, pm, in_show=True) for e in eps]
+        return items
+
+    # views
+    @staticmethod
+    def emit(*objs):
+        for o in objs:
+            sys.stdout.write(json.dumps(o, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+    def which_view(self, q):
+        if self.lib:
+            for s in self.lib["shows"]:
+                if q.startswith(s["title"] + SEP):
+                    return ("show", s["title"])
+        return ("home", None)
+
+    def redraw(self, force=True):
+        if self.view is not None:
+            self.show_view(self.view, force)
+
+    def show_view(self, view, force=False):
+        if view == self.view and not force:
+            return  # doit filters within a view
+        self.view = view
+        if not self.lib:
+            self.emit({"items": [{"title": "Loading your library…", "icon": "view-refresh", "sticky": True}]})
+            return
+        kind, arg = view
+        if kind == "home":
+            self.emit({"scope": None}, {"layout": {"columns": "auto", "aspect": 1.5}},
+                      {"placeholder": "Search movies and shows…"}, {"items": self.home_items()})
+        else:
+            try:
+                items = self.show_items(arg)
+            except Exception as e:  # noqa: BLE001
+                items = [{"title": "Couldn't load episodes", "subtitle": str(e), "icon": "dialog-error", "sticky": True}]
+            self.emit({"layout": None}, {"scope": {"match": arg + SEP, "label": arg}},
+                      {"placeholder": f"Search {arg}…"}, {"items": items})
+
+    # actions
+    def activate(self, iid, action, q):
+        kind, _, arg = (iid or "").partition(":")
+        if kind == "show":
+            nxt = self.next_up(arg)
+            if not nxt:
+                return
+            kind, arg = "ep", str(nxt["id"])
+            action = action if (action or "").startswith("tv:") else None
+        if kind not in ("mv", "ep"):
+            return
+        item_id = int(arg)
+        if action in (None, "start"):
+            detach("--play", str(item_id), *(["--from-start"] if action == "start" else []))
+        elif action == "trailer":
+            detach("--trailer", str(item_id))
+        elif action.startswith("tv:"):
+            self.api.call("POST", f"/api/devices/{action[3:]}/commands", {"type": "playItem", "payload": {"itemId": item_id}})
+        elif action in ("watched", "unwatched", "wl-add", "wl-del"):
+            if action == "watched":
+                dur = next((m.get("durationMs") for m in self.lib["movies"] if m["id"] == item_id), None) or \
+                    (self.progress().get(item_id) or {}).get("durationMs") or 1
+                self.api.call("PUT", f"/api/items/{item_id}/progress", {"positionMs": dur, "durationMs": dur,
+                                                                       "completed": True, "state": "stop",
+                                                                       "continuousMs": 0})
+            elif action == "unwatched":
+                self.api.call("DELETE", f"/api/items/{item_id}/progress")
+            elif action == "wl-add":
+                self.api.call("PUT", f"/api/items/{item_id}/watchlist", {})
+            else:
+                self.api.call("DELETE", f"/api/items/{item_id}/watchlist")
+            threading.Thread(target=self.refresh, daemon=True).start()  # stays open: show the change
+
+    def run(self):
+        self.emit({"activations": True, "prompt": "popcorn"})
+        threading.Thread(target=self.refresh, daemon=True).start()
+        for line in sys.stdin:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            q = msg.get("query", "")
+            if "activate" in msg:
+                a = msg["activate"]
+                try:
+                    self.activate(a.get("id"), a.get("action"), q)
+                except Exception as e:  # noqa: BLE001
+                    self.emit({"message": f"Popcorn: {e}"})
+            else:
+                self.show_view(self.which_view(q))
+
+
+KEEP = ("id", "kind", "title", "originalTitle", "year", "durationMs", "posterPath", "backdropPath", "genres",
+        "directors", "rating", "showTitle", "seasonNumber", "episodeNumber", "episodeTitle", "episodeCount",
+        "seasonCount", "posterItemId", "posterMtimeUnix")
+
+
+def slim(it):
+    """Only what the mode shows or searches: keeps the on-disk cache small."""
+    return {k: it[k] for k in KEEP if k in it}
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ["--play"]:
+        play(int(args[1]), from_start="--from-start" in args)
+    elif args[:1] == ["--trailer"]:
+        play_trailer(int(args[1]))
+    elif args[:1] == ["--launch"]:
+        me = os.path.abspath(__file__)
+        os.execvp("doit", ["doit", "-P", json.dumps(me), "-p", "popcorn", "-w", "1180", "-l", "11", "--no-custom", *args[1:]])
+    elif args[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+    else:
+        try:
+            Provider().run()
+        except (BrokenPipeError, KeyboardInterrupt):
+            pass
+
+
+if __name__ == "__main__":
+    main()

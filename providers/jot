@@ -1,0 +1,1530 @@
+#!/usr/bin/env python3
+"""doit mode for Jot, the self-hosted notes and todos.
+
+  Type to capture: the first row adds what you typed, read the way Jot reads
+  it ("Dentist tomorrow 10am #health", "Gym every mon and thu 7am", "Zahnarzt
+  morgen um 10", "Shopping: milk, eggs, bread", a trailing " !" pins). The rows
+  below are what it finds among your notes and todos.
+
+  Empty, it's your day: overdue, today, the next week, then pinned notes and
+  the rest. Enter completes a task (a repeating one moves to its next date)
+  and opens a note in Jot; a checklist opens in place, Enter ticks a check,
+  and typing adds one. Tab: snooze, tomorrow, reschedule (type a date the
+  same way), pin, archive, trash, copy, open in Jot. #label shows a label.
+
+Settings in ~/.config/doit/jot.toml:
+
+  server = "https://jot.example.com"
+  username = "me"          # optional; asked for at sign-in otherwise
+
+As a launcher mode:
+
+  [[provider]]
+  name = "jot"
+  exec = "~/.config/doit/providers/jot"
+  prefix = "j "
+
+or on its own: doit -m jot, or this script with --launch.
+
+Everything is cached (mode 600) under ~/.cache/doit/jot, so it opens at
+once and captures offline; changes go to the server as soon as it's there.
+"""
+
+import base64
+import hashlib
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+import urllib.error
+import urllib.request
+from datetime import date, datetime, timedelta
+
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "doit", "jot")
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "doit", "jot.toml")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Dates: day numbers (days since 1970-01-01), as Jot's clients count them.
+# ═════════════════════════════════════════════════════════════════════════════
+
+EPOCH = date(1970, 1, 1)
+WD = ["mo", "tu", "we", "th", "fr", "sa", "su"]
+
+
+def day_num(y, m, d):
+    return (date(y, m, d) - EPOCH).days
+
+
+def from_day(n):
+    t = EPOCH + timedelta(days=n)
+    return t.year, t.month, t.day
+
+
+def weekday(n):
+    return (n + 3) % 7  # 0 = Monday; 1970-01-01 was a Thursday
+
+
+def days_in_month(y, m):
+    return ((date(y + m // 12, m % 12 + 1, 1)) - date(y, m, 1)).days
+
+
+def parse_due(s):
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2}))?", s or "")
+    if not m:
+        return None
+    return day_num(int(m[1]), int(m[2]), int(m[3])), (int(m[4]) * 60 + int(m[5]) if m[4] else None)
+
+
+def fmt_due(day, minute):
+    y, m, d = from_day(day)
+    s = f"{y:04d}-{m:02d}-{d:02d}"
+    return s if minute is None else f"{s}T{minute // 60:02d}:{minute % 60:02d}"
+
+
+def add_months(day, months, dom):
+    y, m, d = from_day(day)
+    idx = y * 12 + m - 1 + months
+    ny, nm = idx // 12, idx % 12 + 1
+    return day_num(ny, nm, min(dom or d, days_in_month(ny, nm)))
+
+
+def now_parts():
+    t = datetime.now()
+    return day_num(t.year, t.month, t.day), t.hour * 60 + t.minute
+
+
+WD_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+WD_LONG = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+MON_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def rel_day(day, today):
+    diff = day - today
+    if diff == 0:
+        return "Today"
+    if diff == 1:
+        return "Tomorrow"
+    if diff == -1:
+        return "Yesterday"
+    y, m, d = from_day(day)
+    if 1 < diff < 7:
+        return WD_LONG[weekday(day)]
+    base = f"{WD_SHORT[weekday(day)]} {d} {MON_SHORT[m - 1]}"
+    return base if y == from_day(today)[0] else f"{d} {MON_SHORT[m - 1]} {y}"
+
+
+def human_due(due, today):
+    p = parse_due(due)
+    if not p:
+        return ""
+    r = rel_day(p[0], today)
+    return r if p[1] is None else f"{r} {p[1] // 60:02d}:{p[1] % 60:02d}"
+
+
+def human_repeat(r):
+    if not r:
+        return ""
+    n = max(1, r.get("interval") or 1)
+    freq = r.get("freq")
+    names = {"mo": "Mon", "tu": "Tue", "we": "Wed", "th": "Thu", "fr": "Fri", "sa": "Sat", "su": "Sun"}
+    if freq == "week" and r.get("byDay"):
+        days = r["byDay"]
+        s = "weekdays" if days == ["mo", "tu", "we", "th", "fr"] else "every " + ", ".join(names[d] for d in days)
+        if n > 1:
+            s += f" every {n} weeks"
+    elif freq == "month" and r.get("monthDay"):
+        d = r["monthDay"]
+        s = f"monthly on the {d}{'th' if 10 <= d % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(d % 10, 'th')}"
+    else:
+        unit = {"day": "day", "week": "week", "month": "month", "year": "year"}.get(freq, "day")
+        s = {"day": "daily", "week": "weekly", "month": "monthly", "year": "yearly"}.get(freq, "") if n == 1 \
+            else f"every {n} {unit}s"
+    if r.get("fromCompletion"):
+        s += " after done"
+    return s
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Repeats (Jot's SPEC §4)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def next_after(base, r, anchor):
+    n = max(1, r.get("interval") or 1)
+    freq = r.get("freq")
+    if freq == "day":
+        return base + n
+    if freq == "week":
+        days = sorted(WD.index(d) for d in (r.get("byDay") or []) if d in WD)
+        if not days:
+            return base + 7 * n
+        wd = weekday(base)
+        for d in days:
+            if d > wd:
+                return base + (d - wd)
+        return base - wd + 7 * n + days[0]
+    if freq == "month":
+        return add_months(base, n, r.get("monthDay") or from_day(anchor)[2])
+    if freq == "year":
+        by = from_day(base)[0]
+        _, am, ad = from_day(anchor)
+        y = by + n
+        return day_num(y, am, min(ad, days_in_month(y, am)))
+    return base + 1
+
+
+def occurs_on(day, r):
+    if r.get("freq") == "week" and r.get("byDay"):
+        return WD[weekday(day)] in r["byDay"]
+    if r.get("freq") == "month" and r.get("monthDay"):
+        y, m, d = from_day(day)
+        return d == min(r["monthDay"], days_in_month(y, m))
+    return True
+
+
+def first_occurrence(start, minute, r, now_day, now_min):
+    day = start
+    for _ in range(800):
+        not_past = day >= now_day if minute is None else day > now_day or (day == now_day and minute > now_min)
+        if not_past and occurs_on(day, r):
+            return day
+        day += 1
+    return start
+
+
+def complete_fields(it, now_day, now_min, now_ms):
+    """The fields that change when the item is completed (repeat-aware)."""
+    due, r = parse_due(it.get("due")), it.get("repeat")
+    if not r or not due:
+        return {"done": True, "doneAt": now_ms, "snoozedUntil": ""}
+    base = now_day if r.get("fromCompletion") else due[0]
+    nxt = next_after(base, r, due[0])
+    if not r.get("fromCompletion"):
+        def in_past(d):
+            return d <= now_day if due[1] is None else d < now_day or (d == now_day and due[1] <= now_min)
+        guard = 0
+        while in_past(nxt) and guard < 10000:
+            nxt, guard = next_after(nxt, r, due[0]), guard + 1
+    if r.get("until"):
+        u = parse_due(r["until"])
+        if u and nxt > u[0]:
+            return {"done": True, "doneAt": now_ms, "snoozedUntil": ""}
+    return {"due": fmt_due(nxt, due[1]), "snoozedUntil": "", "done": False, "doneAt": now_ms,
+            "checks": [c if c.get("deleted") else dict(c, done=False) for c in it.get("checks") or []]}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Quick-add (Jot's SPEC §3), English and German
+# ═════════════════════════════════════════════════════════════════════════════
+
+WDAY = {"mon": 0, "monday": 0, "montag": 0, "tue": 1, "tues": 1, "tuesday": 1, "dienstag": 1,
+        "wed": 2, "wednesday": 2, "mittwoch": 2, "thu": 3, "thur": 3, "thurs": 3, "thursday": 3, "donnerstag": 3,
+        "fri": 4, "friday": 4, "freitag": 4, "sat": 5, "saturday": 5, "samstag": 5,
+        "sun": 6, "sunday": 6, "sonntag": 6}
+WDAY2 = {"mo": 0, "di": 1, "mi": 2, "do": 3, "fr": 4, "sa": 5, "so": 6}
+WDAY_PLURAL = {"mondays": 0, "montags": 0, "tuesdays": 1, "dienstags": 1, "wednesdays": 2, "mittwochs": 2,
+               "thursdays": 3, "donnerstags": 3, "fridays": 4, "freitags": 4, "saturdays": 5, "samstags": 5,
+               "sundays": 6, "sonntags": 6}
+MONTHS = {"jan": 1, "january": 1, "januar": 1, "jänner": 1, "jaenner": 1, "feb": 2, "february": 2, "februar": 2,
+          "mar": 3, "march": 3, "märz": 3, "maerz": 3, "mrz": 3, "apr": 4, "april": 4, "may": 5, "mai": 5,
+          "jun": 6, "june": 6, "juni": 6, "jul": 7, "july": 7, "juli": 7, "aug": 8, "august": 8,
+          "sep": 9, "sept": 9, "september": 9, "oct": 10, "october": 10, "okt": 10, "oktober": 10,
+          "nov": 11, "november": 11, "dec": 12, "december": 12, "dez": 12, "dezember": 12}
+PREFIX = {"on", "am", "at", "um", "by", "bis", "@", "due"}
+EVERY = {"every", "each", "jeden", "jede", "jedes", "jeder", "alle"}
+AND = {",", "and", "und", "&", "+"}
+UNIT = {"day": "day", "days": "day", "d": "day", "tag": "day", "tage": "day", "tagen": "day",
+        "week": "week", "weeks": "week", "w": "week", "woche": "week", "wochen": "week",
+        "month": "month", "months": "month", "monat": "month", "monate": "month", "monaten": "month",
+        "year": "year", "years": "year", "y": "year", "jahr": "year", "jahre": "year", "jahren": "year",
+        "hour": "hour", "hours": "hour", "h": "hour", "hr": "hour", "hrs": "hour", "stunde": "hour",
+        "stunden": "hour", "std": "hour",
+        "min": "min", "mins": "min", "minute": "min", "minutes": "min", "minuten": "min"}
+EVENING = 19 * 60
+WORKDAYS = ["mo", "tu", "we", "th", "fr"]
+NEXT_RE = re.compile(r"^(next|nächste|nächsten|nächster|nächstes|naechste|naechsten|naechster|kommenden|kommender|coming)$")
+DAYNUM_RE = re.compile(r"^(\d{1,2})(?:\.|st|nd|rd|th)?$")
+
+
+def is_num(s):
+    return bool(s) and s.isascii() and s.isdigit()
+
+
+def month_of(s):
+    return MONTHS.get(s[:-1] if s.endswith(".") else s) if s else None
+
+
+def valid_date(y, m, d):
+    return 1 <= m <= 12 and 1 <= d <= days_in_month(y, m)
+
+
+def next_yearless(m, d, today):
+    y = from_day(today)[0]
+    if not valid_date(y, m, d) and not (m == 2 and d == 29):
+        return None
+    for _ in range(8):
+        if valid_date(y, m, d) and day_num(y, m, d) >= today:
+            return day_num(y, m, d)
+        y += 1
+    return None
+
+
+def full_year(s):
+    return 2000 + int(s) if len(s) == 2 else int(s)
+
+
+def tokenize(line):
+    return [{"t": m.group(), "l": m.group().lower(), "s": m.start(), "e": m.end()}
+            for m in re.finditer(r"[^\s,]+|,", line)]
+
+
+def tl(T, i):
+    return T[i]["l"] if 0 <= i < len(T) else None
+
+
+def match_time(T, i, prefixed):
+    a, b = tl(T, i), tl(T, i + 1)
+    if not a:
+        return None
+    if a in ("noon", "mittag", "mittags"):
+        return {"n": 1, "time": 12 * 60}
+    if a in ("midnight", "mitternacht"):
+        return {"n": 1, "time": 0}
+
+    def h12(h, mm, ap):
+        if h < 1 or h > 12 or mm > 59:
+            return None
+        return (h % 12 + (12 if ap.startswith("p") else 0)) * 60 + mm
+
+    def h24(h, mm):
+        return h * 60 + mm if h <= 23 and mm <= 59 else None
+
+    def res(n, t):
+        return None if t is None else {"n": n, "time": t}
+
+    m = re.match(r"^(\d{1,2})(?::(\d{2}))?(am|pm|a\.m\.|p\.m\.)$", a)
+    if m:
+        return res(1, h12(int(m[1]), int(m[2] or 0), m[3]))
+    m = re.match(r"^(\d{1,2}):(\d{2})(?:h|uhr)?$", a)
+    if m:
+        if b in ("am", "pm"):
+            return res(2, h12(int(m[1]), int(m[2]), b))
+        return res(2 if b == "uhr" else 1, h24(int(m[1]), int(m[2])))
+    m = re.match(r"^(\d{1,2})(?:h|uhr)$", a)
+    if m:
+        return res(1, h24(int(m[1]), 0))
+    if is_num(a) and len(a) <= 2:
+        if b in ("am", "pm"):
+            return res(2, h12(int(a), 0, b))
+        if b == "uhr":
+            return res(2, h24(int(a), 0))
+        if prefixed:
+            return res(1, h24(int(a), 0))
+    return None
+
+
+def with_evening(T, i, r):
+    if tl(T, i + r["n"]) in ("abend", "evening", "night"):
+        return dict(r, n=r["n"] + 1, time=EVENING)
+    return r
+
+
+def next_weekday(today, wd, include_today=False):
+    diff = (wd - weekday(today) + 7) % 7
+    if diff == 0 and not include_today:
+        diff = 7
+    return today + diff
+
+
+def match_date(T, i, ctx, prefixed):
+    a, b, c = tl(T, i), tl(T, i + 1), tl(T, i + 2)
+    if not a:
+        return None
+    today = ctx["day"]
+    if a in ("today", "heute"):
+        return with_evening(T, i, {"n": 1, "date": today})
+    if a == "tonight":
+        return {"n": 1, "date": today, "time": EVENING}
+    if a in ("tomorrow", "tmrw", "tmr", "morgen"):
+        return with_evening(T, i, {"n": 1, "date": today + 1})
+    if a in ("übermorgen", "uebermorgen"):
+        return with_evening(T, i, {"n": 1, "date": today + 2})
+    if a in ("weekend", "wochenende"):
+        return {"n": 1, "date": next_weekday(today, 5, True)}
+    if a in ("this", "dieses", "am") and b in ("weekend", "wochenende"):
+        return {"n": 2, "date": next_weekday(today, 5, True)}
+    if NEXT_RE.match(a) and b:
+        if b in ("week", "woche"):
+            return {"n": 2, "date": next_weekday(today, 0)}
+        if b in ("month", "monat"):
+            y, mo, _ = from_day(today)
+            return {"n": 2, "date": day_num(y + 1, 1, 1) if mo == 12 else day_num(y, mo + 1, 1)}
+        if b in ("year", "jahr"):
+            return {"n": 2, "date": day_num(from_day(today)[0] + 1, 1, 1)}
+        wd = WDAY.get(b, WDAY2.get(b))
+        if wd is not None:
+            return {"n": 2, "date": next_weekday(today, wd)}
+    if a in WDAY:
+        return {"n": 1, "date": next_weekday(today, WDAY[a])}
+    if a in WDAY2 and (prefixed or match_time(T, i + 1, False)):
+        return {"n": 1, "date": next_weekday(today, WDAY2[a])}
+    if a == "in" and b:
+        n = unit = None
+        used = 0
+        m = re.match(r"^(\d+)(d|w|h|m|min)$", b)
+        if is_num(b) and c in UNIT:
+            n, unit, used = int(b), UNIT[c], 3
+        elif m:
+            n, unit, used = int(m[1]), {"d": "day", "w": "week", "h": "hour", "m": "min", "min": "min"}[m[2]], 2
+        elif b in ("a", "an", "einer", "einem", "one") and c in UNIT:
+            n, unit, used = 1, UNIT[c], 3
+        if n is not None and unit:
+            if unit == "day":
+                return {"n": used, "date": today + n}
+            if unit == "week":
+                return {"n": used, "date": today + 7 * n}
+            if unit == "month":
+                y, mo, d = from_day(today)
+                idx = y * 12 + mo - 1 + n
+                ny, nm = idx // 12, idx % 12 + 1
+                return {"n": used, "date": day_num(ny, nm, min(d, days_in_month(ny, nm)))}
+            if unit == "year":
+                y, mo, d = from_day(today)
+                return {"n": used, "date": day_num(y + n, mo, min(d, days_in_month(y + n, mo)))}
+            total = -(-(today * 1440 + ctx["min"] + (60 if unit == "hour" else 1) * n) // 5) * 5
+            return {"n": used, "date": total // 1440, "time": total % 1440}
+    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", a)
+    if m:
+        y, mo, d = int(m[1]), int(m[2]), int(m[3])
+        return {"n": 1, "date": day_num(y, mo, d)} if valid_date(y, mo, d) else None
+    m = re.match(r"^(\d{1,2})\.(\d{1,2})(?:\.(\d{4}|\d{2})?)?$", a)
+    if m:
+        d, mo = int(m[1]), int(m[2])
+        if m[3]:
+            y = full_year(m[3])
+            return {"n": 1, "date": day_num(y, mo, d)} if valid_date(y, mo, d) else None
+        dt = next_yearless(mo, d, today)
+        return None if dt is None else {"n": 1, "date": dt}
+    m = re.match(r"^(\d{1,2})/(\d{1,2})(?:/(\d{4}|\d{2}))?$", a)
+    if m:
+        mo, d = int(m[1]), int(m[2])
+        if m[3]:
+            y = full_year(m[3])
+            return {"n": 1, "date": day_num(y, mo, d)} if valid_date(y, mo, d) else None
+        dt = next_yearless(mo, d, today)
+        return None if dt is None else {"n": 1, "date": dt}
+    m = DAYNUM_RE.match(a)
+    if m and month_of(b):
+        d, mo = int(m[1]), month_of(b)
+        if is_num(c) and len(c) == 4:
+            return {"n": 3, "date": day_num(int(c), mo, d)} if valid_date(int(c), mo, d) else None
+        dt = next_yearless(mo, d, today)
+        return None if dt is None else {"n": 2, "date": dt}
+    m = DAYNUM_RE.match(b) if b else None
+    if month_of(a) and m:
+        d, mo = int(m[1]), month_of(a)
+        k = 2
+        if c == "," and is_num(tl(T, i + 3)) and len(tl(T, i + 3)) == 4:
+            k = 3
+        y_tok = tl(T, i + k)
+        if is_num(y_tok) and len(y_tok) == 4:
+            return {"n": k + 1, "date": day_num(int(y_tok), mo, d)} if valid_date(int(y_tok), mo, d) else None
+        dt = next_yearless(mo, d, today)
+        return None if dt is None else {"n": 2, "date": dt}
+    return None
+
+
+def weekday_list(T, i):
+    def wd_of(s):
+        return WDAY.get(s, WDAY2.get(s, WDAY_PLURAL.get(s))) if s else None
+    days, j = [], i
+    while j < len(T):
+        w = wd_of(T[j]["l"])
+        if w is None:
+            break
+        days.append(w)
+        j += 1
+        if j < len(T) and T[j]["l"] in AND and wd_of(tl(T, j + 1)) is not None:
+            j += 1
+            continue
+        break
+    return {"n": j - i, "byDay": [WD[d] for d in sorted(set(days))]} if days else None
+
+
+def match_after_done(T, i):
+    a, b = tl(T, i), tl(T, i + 1)
+    if a == "after" and b in ("done", "completion", "completed", "finishing"):
+        return 2
+    if a == "nach" and b in ("erledigung", "abschluss", "erledigt"):
+        return 2
+    return 0
+
+
+def match_repeat(T, i):
+    a = tl(T, i)
+    if not a:
+        return None
+    r, n = None, 0
+    if a in ("daily", "täglich", "taeglich"):
+        r, n = {"freq": "day", "interval": 1}, 1
+    elif a in ("weekdays", "werktags", "wochentags"):
+        r, n = {"freq": "week", "interval": 1, "byDay": WORKDAYS}, 1
+    elif a in ("weekly", "wöchentlich", "woechentlich"):
+        r, n = {"freq": "week", "interval": 1}, 1
+    elif a in ("biweekly", "fortnightly"):
+        r, n = {"freq": "week", "interval": 2}, 1
+    elif a in ("monthly", "monatlich"):
+        r, n = {"freq": "month", "interval": 1}, 1
+    elif a in ("yearly", "annually", "jährlich", "jaehrlich"):
+        r, n = {"freq": "year", "interval": 1}, 1
+    elif a in WDAY_PLURAL:
+        wl = weekday_list(T, i)
+        r, n = {"freq": "week", "interval": 1, "byDay": wl["byDay"]}, wl["n"]
+    elif a in EVERY:
+        j, interval = i + 1, 1
+        if tl(T, j) in ("other", "zweiten"):
+            interval, j = 2, j + 1
+        b, c = tl(T, j), tl(T, j + 1)
+        if not b:
+            return None
+        m = re.match(r"^(\d{1,2})(st|nd|rd|th|\.)$", b)
+        if b in ("day", "tag"):
+            r, n = {"freq": "day", "interval": interval}, j + 1 - i
+        elif b in ("weekday", "werktag", "wochentag"):
+            r, n = {"freq": "week", "interval": 1, "byDay": WORKDAYS}, j + 1 - i
+        elif b in ("week", "woche"):
+            r, n = {"freq": "week", "interval": interval}, j + 1 - i
+        elif b in ("month", "monat"):
+            r, n = {"freq": "month", "interval": interval}, j + 1 - i
+        elif b in ("year", "jahr"):
+            r, n = {"freq": "year", "interval": interval}, j + 1 - i
+        elif is_num(b) and UNIT.get(c) in ("day", "week", "month", "year"):
+            r, n = {"freq": UNIT[c], "interval": max(1, int(b))}, j + 2 - i
+        elif m and 1 <= int(m[1]) <= 31:
+            r, n = {"freq": "month", "interval": 1, "monthDay": int(m[1])}, j + 1 - i
+        else:
+            wl = weekday_list(T, j)
+            if wl:
+                r, n = {"freq": "week", "interval": interval, "byDay": wl["byDay"]}, j + wl["n"] - i
+    if not r:
+        return None
+    k = match_after_done(T, i + n)
+    if k:
+        r["fromCompletion"], n = True, n + k
+    return {"n": n, "repeat": r}
+
+
+def quickadd(text, now_day, now_min):
+    """Text → {title, kind, checks, labels, due, repeat, pinned, tokens}."""
+    ctx = {"day": now_day, "min": now_min}
+    lines = text.split("\n")
+    line = lines[0]
+    T = tokenize(line)
+    st = {"date": None, "time": None, "repeat": None, "pinned": False}
+    labels, tokens = [], []
+    i = 0
+    while i < len(T):
+        tok = T[i]
+        hit = None
+        lm = re.match(r"^#([\w-]+)$", tok["t"])
+        if lm:
+            hit = (1, "label", lambda lm=lm: labels.append(lm[1].lower()))
+        if not hit and tok["t"] == "!" and i == len(T) - 1 and i > 0:
+            hit = (1, "pin", lambda: st.update(pinned=True))
+        if not hit and not st["repeat"]:
+            r = match_repeat(T, i)
+            if r:
+                hit = (r["n"], "repeat", lambda r=r: st.update(repeat=r["repeat"]))
+        if not hit and st["repeat"] and not st["repeat"].get("fromCompletion"):
+            k = match_after_done(T, i)
+            if k:
+                hit = (k, "repeat", lambda: st["repeat"].update(fromCompletion=True))
+
+        def set_date(d):
+            st["date"] = d["date"]
+            if d.get("time") is not None and st["time"] is None:
+                st["time"] = d["time"]
+        if not hit and tok["l"] in PREFIX and i + 1 < len(T):
+            d = match_date(T, i + 1, ctx, True) if st["date"] is None else None
+            if d:
+                hit = (d["n"] + 1, "date", lambda d=d: set_date(d))
+            elif st["time"] is None:
+                t = match_time(T, i + 1, True)
+                if t:
+                    hit = (t["n"] + 1, "time", lambda t=t: st.update(time=t["time"]))
+        if not hit and st["date"] is None:
+            d = match_date(T, i, ctx, False)
+            if d:
+                hit = (d["n"], "date", lambda d=d: set_date(d))
+        if not hit and st["time"] is None:
+            t = match_time(T, i, False)
+            if t:
+                hit = (t["n"], "time", lambda t=t: st.update(time=t["time"]))
+        if hit:
+            n, kind, apply = hit
+            apply()
+            tokens.append({"s": T[i]["s"], "e": T[i + n - 1]["e"], "type": kind})
+            i += n
+            continue
+        i += 1
+
+    title, last = "", 0
+    for t in tokens:
+        title += line[last:t["s"]]
+        last = t["e"]
+    title += line[last:]
+    title = re.sub(r"\s+", " ", title)
+    title = re.sub(r"\s+,", ",", title)
+    title = re.sub(r"^[\s,]+|[\s,]+$", "", title)
+
+    kind, checks = "note", []
+    rest = [ln for ln in lines[1:] if ln.strip()]
+    if rest:
+        kind = "list"
+        for ln in rest:
+            m = re.match(r"^\s*(?:[-*•]\s+|\[( |x|X)?\]\s*)?(.*)$", ln)
+            if m[2].strip():
+                checks.append({"text": m[2].strip(), "done": m[1] in ("x", "X")})
+    else:
+        cm = re.match(r"^([^:]+):\s*(.+)$", title)
+        if cm and "," in cm[2]:
+            parts = [p.strip() for p in cm[2].split(",") if p.strip()]
+            if len(parts) >= 2:
+                kind, title = "list", cm[1].strip()
+                checks = [{"text": p, "done": False} for p in parts]
+
+    due = ""
+    if st["date"] is not None:
+        due = fmt_due(st["date"], st["time"])
+    elif st["repeat"]:
+        due = fmt_due(first_occurrence(now_day, st["time"], st["repeat"], now_day, now_min), st["time"])
+    elif st["time"] is not None:
+        due = fmt_due(now_day if st["time"] > now_min else now_day + 1, st["time"])
+    return {"title": title, "kind": kind, "checks": checks, "labels": sorted(set(labels)), "due": due,
+            "repeat": st["repeat"], "pinned": st["pinned"], "tokens": tokens}
+
+
+def parse_when(text, now_day, now_min):
+    r = quickadd("x " + text, now_day, now_min)
+    return r["due"], r["repeat"], any(t["type"] != "label" for t in r["tokens"])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Items: ids, change stamps (SPEC §2b), search
+# ═════════════════════════════════════════════════════════════════════════════
+
+CROCK = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+GROUPS = {"title": ["title"], "body": ["body"], "kind": ["kind"], "color": ["color"], "labels": ["labels"],
+          "pinned": ["pinned"], "archived": ["archived"],
+          "schedule": ["done", "doneAt", "due", "remind", "alerts", "snoozedUntil", "repeat"],
+          "sort": ["sort"], "images": ["images"], "trash": ["trashedAt"]}
+COLORS = {"red": "#e5484d", "orange": "#f76b15", "yellow": "#ffc53d", "green": "#30a46c", "teal": "#12a594",
+          "blue": "#0090ff", "purple": "#8e4ec6", "pink": "#d6409f", "brown": "#ad7f58", "gray": "#8b8d98"}
+
+
+def ulid(t=None):
+    t = int(time.time() * 1000) if t is None else t
+    ts = ""
+    for _ in range(10):
+        ts, t = CROCK[t % 32] + ts, t // 32
+    return ts + "".join(CROCK[b % 32] for b in secrets.token_bytes(16))
+
+
+def short_id():
+    return ulid()[-10:].lower()
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def new_item(fields):
+    now = now_ms()
+    it = {"id": ulid(now), "kind": "note", "title": "", "body": "", "checks": [], "color": "", "labels": [],
+          "pinned": False, "archived": False, "done": False, "doneAt": 0, "due": "", "remind": True,
+          "snoozedUntil": "", "repeat": None, "sort": now, "createdAt": now, "updatedAt": now,
+          "trashedAt": 0, "deleted": False}
+    it.update(fields)
+    it["checks"] = [dict({"id": short_id(), "indent": 0, "done": False, "u": now}, **c) for c in fields.get("checks", [])]
+    return it
+
+
+def stamped(prev, nxt, now):
+    """`nxt` with fm and check stamps for what changed since `prev`."""
+    out = dict(nxt)
+    fm = dict(prev.get("fm") or {})
+    for g, fields in GROUPS.items():
+        if any(json.dumps(prev.get(f)) != json.dumps(nxt.get(f)) for f in fields):
+            fm[g] = now
+    before = {c["id"]: c for c in prev.get("checks") or []}
+    checks, order_changed = [], False
+    for c in nxt.get("checks") or []:
+        p = before.get(c["id"])
+        if c.get("deleted"):
+            checks.append(p if p and p.get("deleted") else {"id": c["id"], "deleted": True, "u": now})
+            order_changed |= bool(p and not p.get("deleted"))
+            continue
+        changed = not p or p.get("deleted") or p.get("text") != c.get("text") or bool(p.get("done")) != bool(c.get("done")) \
+            or (p.get("indent") or 0) != (c.get("indent") or 0)
+        order_changed |= not p or bool(p.get("deleted"))
+        checks.append(dict(c, u=now) if changed else c)
+    if prev.get("checks") or nxt.get("checks"):
+        out["checks"] = checks
+    if order_changed:
+        fm["order"] = now
+    out["fm"], out["updatedAt"] = fm, now
+    return out
+
+
+def norm(s):
+    return "".join(ch for ch in unicodedata.normalize("NFD", s or "") if not unicodedata.combining(ch)).lower()
+
+
+def live_checks(it):
+    return [c for c in it.get("checks") or [] if not c.get("deleted")]
+
+
+def haystack(it):
+    return norm("\n".join([it.get("title") or "", it.get("body") or ""] + [c.get("text") or "" for c in live_checks(it)]
+                          + ["#" + lb + " " + lb for lb in it.get("labels") or []]))
+
+
+def alive(it):
+    return not it.get("deleted") and not it.get("trashedAt")
+
+
+def due_key(it):
+    p = parse_due(it.get("due"))
+    return (p[0] * 1440 + (p[1] if p[1] is not None else -1)) if p else float("inf")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Server and cache
+# ═════════════════════════════════════════════════════════════════════════════
+
+class AuthError(Exception):
+    pass
+
+
+def load_config():
+    cfg = {}
+    try:
+        import tomllib
+        with open(CONFIG, "rb") as fh:
+            cfg = tomllib.load(fh)
+    except (OSError, ValueError, ImportError):
+        pass
+    if os.environ.get("JOT_SERVER"):
+        cfg["server"] = os.environ["JOT_SERVER"]
+    if cfg.get("server"):
+        cfg["server"] = cfg["server"].rstrip("/")
+    return cfg
+
+
+def private_write(path, data):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(data)
+    os.replace(tmp, path)
+
+
+class Jot:
+    """Items mirrored from the server, kept in a private cache file."""
+
+    def __init__(self, server):
+        self.server = server
+        key = hashlib.sha1(server.encode()).hexdigest()[:10]
+        self.state_path = os.path.join(CACHE, f"state-{key}.json")
+        self.token_path = os.path.join(CACHE, f"token-{key}")
+        self.lock = threading.RLock()
+        self.items, self.rev, self.dirty = {}, 0, {}
+        self.settings = {}
+        try:
+            with open(self.state_path) as fh:
+                st = json.load(fh)
+            self.items, self.rev = st.get("items", {}), st.get("rev", 0)
+            self.dirty, self.settings = st.get("dirty", {}), st.get("settings", {})
+        except (OSError, ValueError):
+            pass
+        try:
+            with open(self.token_path) as fh:
+                self.token = fh.read().strip() or None
+        except OSError:
+            self.token = None
+
+    def save(self):
+        with self.lock:
+            data = json.dumps({"rev": self.rev, "items": self.items, "dirty": self.dirty, "settings": self.settings})
+        private_write(self.state_path, data)
+
+    def request(self, method, path, body=None, timeout=10, auth=True):
+        req = urllib.request.Request(self.server + path, method=method,
+                                     data=None if body is None else json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", "User-Agent": "doit-jot"})
+        if auth:
+            if not self.token:
+                raise AuthError()
+            req.add_header("Authorization", "Bearer " + self.token)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read() or b"null")
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                raise AuthError() from e
+            try:
+                msg = json.loads(e.read()).get("error")
+            except (ValueError, AttributeError):
+                msg = None
+            raise OSError(msg or f"HTTP {e.code}") from e
+
+    def login(self, username, password):
+        r = self.request("POST", "/api/login", {"username": username, "password": password,
+                                                "device": "doit on " + os.uname().nodename}, auth=False)
+        self.token = r["token"]
+        private_write(self.token_path, self.token)
+
+    def logout(self):
+        try:
+            self.request("POST", "/api/logout", {}, timeout=3)
+        except (OSError, AuthError):
+            pass
+        self.token = None
+        for p in (self.token_path, self.state_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        with self.lock:
+            self.items, self.rev, self.dirty = {}, 0, {}
+
+    def sync(self):
+        """Push what changed here, take what changed there. True if anything did."""
+        with self.lock:
+            changes = list(self.dirty.values())
+            since = self.rev
+        r = self.request("POST", "/api/sync", {"since": since, "changes": changes})
+        with self.lock:
+            for it in r.get("items") or []:
+                mine = self.dirty.get(it["id"])
+                if mine is not None and mine not in changes:
+                    continue  # changed again while this was underway: pushed next time
+                self.dirty.pop(it["id"], None)
+                if it.get("deleted"):
+                    self.items.pop(it["id"], None)
+                else:
+                    self.items[it["id"]] = it
+            for c in changes:
+                if self.dirty.get(c["id"]) is c:
+                    self.dirty.pop(c["id"], None)
+            changed = bool(r.get("items")) or r.get("rev", since) != since
+            self.rev = max(self.rev, r.get("rev") or 0)
+        if not self.settings:
+            try:
+                self.settings = self.request("GET", "/api/settings") or {}
+            except (OSError, AuthError):
+                pass
+        self.save()
+        return changed
+
+    def put(self, it):
+        """A local change: kept, then pushed (or kept dirty when offline)."""
+        with self.lock:
+            self.items[it["id"]] = it
+            self.dirty[it["id"]] = it
+        self.save()
+        try:
+            self.sync()
+            return None
+        except AuthError:
+            return "Sign in again to sync this"
+        except OSError as e:
+            return f"Saved here; Jot is unreachable ({e})"
+
+    def change(self, iid, **fields):
+        with self.lock:
+            prev = self.items.get(iid)
+            if prev is None:
+                return None, "That item is gone"
+            nxt = stamped(prev, dict(prev, **fields), now_ms())
+        return nxt, self.put(nxt)
+
+    def events(self, on_rev):
+        """Follow /api/events; call on_rev when the server has newer data."""
+        while self.token:
+            try:
+                req = urllib.request.Request(self.server + "/api/events",
+                                             headers={"Authorization": "Bearer " + self.token,
+                                                      "Accept": "text/event-stream", "User-Agent": "doit-jot"})
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    for raw in r:
+                        line = raw.decode(errors="replace").strip()
+                        if line.startswith("data:"):
+                            try:
+                                if int(line[5:].strip()) > self.rev:
+                                    on_rev()
+                            except ValueError:
+                                pass
+            except AuthError:
+                return
+            except (OSError, ValueError):
+                time.sleep(5)
+
+    def thumbnail(self, img_id):
+        path = os.path.join(CACHE, "thumbs", img_id + ".jpg")
+        if os.path.exists(path):
+            return path
+        try:
+            req = urllib.request.Request(f"{self.server}/api/attachments/{img_id}?w=240",
+                                         headers={"Authorization": "Bearer " + (self.token or ""),
+                                                  "User-Agent": "doit-jot"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = r.read()
+            os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+            return path
+        except (OSError, urllib.error.URLError):
+            return None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Icons: Jot's colours, drawn once into the cache
+# ═════════════════════════════════════════════════════════════════════════════
+
+ICON_SVG = {
+    "task": '<circle cx="24" cy="24" r="15" fill="none" stroke="{c}" stroke-width="3.5"/>',
+    "done": '<circle cx="24" cy="24" r="17" fill="{c}"/><path d="M16 24.5l5.5 5.5L32.5 19" fill="none" '
+            'stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>',
+    "repeat": '<circle cx="24" cy="24" r="15" fill="none" stroke="{c}" stroke-width="3.5" stroke-dasharray="70 8"/>'
+              '<path d="M33 8l6 4-6 4" fill="none" stroke="{c}" stroke-width="3" stroke-linecap="round" '
+              'stroke-linejoin="round"/>',
+    "note": '<rect x="9" y="7" width="30" height="34" rx="6" fill="{c}"/><path d="M16 18h16M16 24h16M16 30h10" '
+            'stroke="#fff" stroke-opacity=".85" stroke-width="3" stroke-linecap="round"/>',
+    "list": '<rect x="9" y="7" width="30" height="34" rx="6" fill="{c}"/><path d="M15 17l2.5 2.5L22 15M15 27l2.5 '
+            '2.5L22 25" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>'
+            '<path d="M26 17.5h7M26 27.5h7" stroke="#fff" stroke-opacity=".85" stroke-width="3" stroke-linecap="round"/>',
+    "check": '<rect x="10" y="10" width="28" height="28" rx="7" fill="none" stroke="{c}" stroke-width="3.5"/>',
+    "checked": '<rect x="9" y="9" width="30" height="30" rx="8" fill="{c}"/><path d="M16 24.5l5.5 5.5L32.5 19" '
+               'fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>',
+    "label": '<path d="M8 12a4 4 0 014-4h12.3a4 4 0 012.8 1.2l13 13a4 4 0 010 5.6L28 39.9a4 4 0 01-5.6 0l-13-13A4 4 0 '
+             '018 24.3z" fill="{c}"/><circle cx="17" cy="17" r="3.2" fill="#fff"/>',
+    "add": '<circle cx="24" cy="24" r="18" fill="{c}"/><path d="M24 15v18M15 24h18" stroke="#fff" stroke-width="3.5" '
+           'stroke-linecap="round"/>',
+}
+DEFAULT_TINT = "#7c8aa5"
+
+
+def icon(kind, color=""):
+    c = COLORS.get(color, DEFAULT_TINT if color != "accent" else "#6e7bf2")
+    path = os.path.join(CACHE, "icons", f"{kind}-{color or 'plain'}.svg")
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "w") as fh:
+            fh.write('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">'
+                     + ICON_SVG[kind].replace("{c}", c) + "</svg>")
+        os.replace(path + ".tmp", path)
+    return path
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# The mode
+# ═════════════════════════════════════════════════════════════════════════════
+
+LIST_SEP = "› "      # a checklist's view:  "list:ID › "
+WHEN_SEP = "› "      # rescheduling:          "when:ID › "
+SNOOZE_MIN = 60
+
+
+class Mode:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.jot = Jot(cfg["server"])
+        self.out_lock = threading.Lock()
+        self.query = ""
+        self.handlers = {}
+        self.scope = None
+        self.undo = None          # (label, item before)
+        self.notice = self.shown_notice = None
+        self.thumbs_wanted = set()
+        self.refresh_lock = threading.Lock()
+
+    def emit(self, *objs):
+        with self.out_lock:
+            for o in objs:
+                sys.stdout.write(json.dumps(o, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+
+    # ── rows ──────────────────────────────────────────────────────────────────
+    def item(self, iid, fn, **row):
+        self.handlers[iid] = fn
+        return dict(row, id=iid)
+
+    def when_bits(self, it, today):
+        bits = []
+        if it.get("due"):
+            p = parse_due(it["due"])
+            snooze = parse_due(it.get("snoozedUntil"))
+            s = human_due(it["due"], today)
+            if snooze:
+                s += f" · snoozed to {human_due(it['snoozedUntil'], today)}"
+            if p and p[0] < today and not it.get("done"):
+                s = "overdue · " + s
+            bits.append(s)
+        if it.get("repeat"):
+            bits.append(human_repeat(it["repeat"]))
+        return bits
+
+    def icon_for(self, it):
+        imgs = it.get("images") or []
+        if imgs:
+            path = os.path.join(CACHE, "thumbs", imgs[0]["id"] + ".jpg")
+            if os.path.exists(path):
+                return path
+            self.thumbs_wanted.add(imgs[0]["id"])
+        color = it.get("color") or ""
+        if it.get("done"):
+            return icon("done", color or "green")
+        if it.get("due"):
+            return icon("repeat" if it.get("repeat") else "task", color)
+        return icon("list" if it.get("kind") == "list" else "note", color)
+
+    def row(self, it, today, badge=None):
+        is_task = bool(it.get("due")) and not it.get("done")
+        bits = self.when_bits(it, today)
+        checks = live_checks(it)
+        if it.get("kind") == "list" and checks:
+            done = sum(1 for c in checks if c.get("done"))
+            bits.append(f"{done}/{len(checks)} done")
+        elif it.get("body"):
+            bits.append(" ".join(it["body"].split())[:90])
+        bits += ["#" + lb for lb in it.get("labels") or []]
+        if it.get("archived"):
+            badge = "archived"
+        elif it.get("done"):
+            badge = badge or "done"
+        elif it.get("pinned") and not badge:
+            badge = "pinned"
+        title = it.get("title") or (it.get("body") or "").split("\n")[0][:80] or "Untitled"
+        acts = []
+        if is_task:
+            if due_key(it) <= today * 1440 + now_parts()[1]:  # its time has come: a reminder to put off
+                acts.append({"title": "Snooze 1 hour", "id": "snooze", "icon": "alarm-symbolic", "keep_open": True})
+            acts += [
+                {"title": "Tomorrow", "id": "tomorrow", "icon": "go-next", "keep_open": True},
+                {"title": "Next week", "id": "nextweek", "icon": "go-last", "keep_open": True},
+            ]
+        if not it.get("archived"):
+            acts.append({"title": "Change the date…" if it.get("due") else "Add a date…", "id": "when",
+                         "icon": "appointment-new", "keep_open": True})
+        if it.get("done"):
+            acts.insert(0, {"title": "Not done", "id": "undone", "icon": "edit-undo", "keep_open": True})
+        elif is_task and it.get("kind") == "list":
+            acts.insert(0, {"title": "Complete", "id": "complete", "icon": "object-select", "keep_open": True})
+        if it.get("due") and not it.get("done"):
+            acts.append({"title": "Remove the date", "id": "nodate", "icon": "edit-clear", "keep_open": True})
+        acts += [
+            {"title": "Unpin" if it.get("pinned") else "Pin", "id": "pin", "icon": "pin", "keep_open": True},
+            {"title": "Unarchive" if it.get("archived") else "Archive", "id": "archive", "icon": "archive",
+             "keep_open": True},
+            {"title": "Move to the trash", "id": "trash", "icon": "user-trash", "keep_open": True},
+            {"title": "Copy the text", "id": "copy", "icon": "edit-copy"},
+            {"title": "Open in Jot", "id": "web", "icon": "internet-web-browser"},
+        ]
+        if it.get("kind") == "list":
+            verb = "Open"
+        elif is_task:
+            verb = "Next date" if it.get("repeat") else "Done"
+        elif it.get("done"):
+            verb = "Not done"
+        else:
+            verb = "Open in Jot"
+        return self.item(it["id"], lambda a, iid=it["id"]: self.on_item(iid, a), title=title,
+                         subtitle=" · ".join(b for b in bits if b), icon=self.icon_for(it), badge=badge,
+                         verb=verb, actions=acts, keep_open=is_task or it.get("kind") == "list")
+
+    # ── views ─────────────────────────────────────────────────────────────────
+    def view(self, q):
+        self.handlers = {}
+        if not self.jot.token:
+            return self.signin_rows()
+        today, minute = now_parts()
+        if q.startswith("list:"):
+            return self.list_view(q, today)
+        if q.startswith("when:"):
+            return self.when_view(q, today, minute)
+        self.set_scope(None)
+        rows = []
+        if self.undo and not q.strip():
+            label, _ = self.undo
+            rows.append(self.item("undo", lambda _a: self.do_undo(), title=f"Undo: {label}", icon="edit-undo",
+                                  sticky=True, keep_open=True, verb="Undo"))
+        if not q.strip():
+            return rows + self.home(today)
+        return rows + self.search(q, today, minute)
+
+    def home(self, today):
+        with self.jot.lock:
+            items = [it for it in self.jot.items.values() if alive(it) and not it.get("archived")]
+        open_tasks = sorted((it for it in items if it.get("due") and not it.get("done")), key=due_key)
+        overdue = [it for it in open_tasks if parse_due(it["due"])[0] < today]
+        due_today = [it for it in open_tasks if parse_due(it["due"])[0] == today]
+        soon = [it for it in open_tasks if today < parse_due(it["due"])[0] <= today + 7]
+        notes = sorted((it for it in items if not it.get("due") and not it.get("done")),
+                       key=lambda it: (not it.get("pinned"), -(it.get("sort") or 0)))
+        rows = [self.row(it, today, "overdue") for it in overdue]
+        rows += [self.row(it, today, "today") for it in due_today]
+        rows += [self.row(it, today, rel_day(parse_due(it["due"])[0], today).split()[0].lower()) for it in soon]
+        rows += [self.row(it, today) for it in notes]
+        if not rows:
+            rows = [{"title": "Nothing here yet", "subtitle": "Type to jot something down", "icon": icon("add", "accent"),
+                     "sticky": True}]
+        return rows
+
+    def search(self, q, today, minute):
+        rows = []
+        words = q.split()
+        last = words[-1] if words and not q.endswith(" ") else ""
+        # "#wo" → the labels that start so, to complete
+        if last.startswith("#"):
+            with self.jot.lock:
+                labels = sorted({lb for it in self.jot.items.values() if alive(it) for lb in it.get("labels") or []})
+            stem = norm(last[1:])
+            for lb in labels:
+                if norm(lb).startswith(stem) and lb != last[1:]:
+                    rows.append({"id": "label:" + lb, "title": "#" + lb, "subtitle": "label",
+                                 "icon": icon("label", "accent"), "set_query": q[:len(q) - len(last)] + "#" + lb + " ",
+                                 "verb": "Complete", "badge": "label"})
+        p = quickadd(q.strip(), today, minute)
+        only_labels = all(w.startswith("#") for w in words)
+        if p["title"] and not only_labels:
+            rows.insert(0, self.capture_row(q.strip(), p, today))
+        # Found by what's left of the words once dates and times are read
+        # out of them ("dentist tomorrow" finds the dentist); a date alone
+        # ("tomorrow", "fri") finds what's due then.
+        terms = norm(p["title"]).split() + ["#" + lb for lb in p["labels"]]
+        if last.startswith("#"):
+            terms = [t for t in terms if t != norm(last)] + [norm(last)]
+        on_day = parse_due(p["due"])[0] if p["due"] and not p["title"] and not p["repeat"] else None
+        if on_day is not None:
+            rows.insert(0, {"title": f"Due {rel_day(on_day, today).lower() if on_day - today in (0, 1) else rel_day(on_day, today)}",
+                            "subtitle": "what's on that day", "icon": "x-office-calendar", "sticky": True,
+                            "id": "dayhead"})
+        with self.jot.lock:
+            if on_day is not None:
+                found = [it for it in self.jot.items.values() if alive(it) and not it.get("archived")
+                         and parse_due(it.get("due")) and parse_due(it["due"])[0] == on_day
+                         and all(t in haystack(it) for t in terms)]
+            elif terms:
+                found = [it for it in self.jot.items.values() if alive(it) and all(t in haystack(it) for t in terms)]
+            else:
+                found = []
+        found.sort(key=lambda it: (bool(it.get("archived")), bool(it.get("done")), not it.get("pinned"),
+                                   due_key(it) if it.get("due") and not it.get("done") else float("inf"),
+                                   -(it.get("sort") or 0)))
+        found_rows = [self.row(it, today) for it in found[:60]]
+        if rows and rows[0].get("id") == "capture" and not p["tokens"] and found and \
+                norm(found[0].get("title")) == norm(p["title"]):
+            # exactly an item's title, nothing else: that item, not a duplicate
+            rows = rows[1:] + found_rows[:1] + rows[:1] + found_rows[1:]
+        else:
+            rows += found_rows
+        if not rows:
+            rows = [{"title": "Nothing found", "subtitle": f"for “{q.strip()}”", "icon": "edit-find", "sticky": True}]
+        return rows
+
+    def capture_row(self, text, p, today):
+        bits = []
+        if p["due"]:
+            bits.append(human_due(p["due"], today))
+        if p["repeat"]:
+            bits.append(human_repeat(p["repeat"]))
+        if p["kind"] == "list":
+            bits.append(f"checklist: {', '.join(c['text'] for c in p['checks'])}")
+        bits += ["#" + lb for lb in p["labels"]]
+        if p["pinned"]:
+            bits.append("pinned")
+        kind = "task" if p["due"] else "note"
+        acts = []
+        if p["tokens"]:
+            acts.append({"title": "Add it word for word", "id": "literal", "icon": "format-text-plain"})
+        acts.append({"title": "Add and keep going", "id": "more", "icon": "list-add", "keep_open": True})
+        return self.item("capture", lambda a: self.capture(text, a), title=p["title"],
+                         subtitle=" · ".join(bits) or ("a todo" if kind == "task" else "a note"),
+                         icon=icon("add", "accent"), badge="new " + ("todo" if p["due"] else "note"), verb="Add",
+                         sticky=True, actions=acts)
+
+    def list_view(self, q, today):
+        iid, _, rest = q[5:].partition(" " + LIST_SEP)
+        it = self.jot.items.get(iid)
+        if not it or not alive(it):
+            self.set_scope(None)
+            return [{"title": "That list is gone", "icon": "dialog-error", "sticky": True, "set_query": ""}]
+        self.set_scope(f"list:{iid} {LIST_SEP}", it.get("title") or "Checklist")
+        text = rest.strip()
+        rows = []
+        if text:
+            rows.append(self.item("addcheck", lambda _a: self.add_check(iid, text), title=text,
+                                  subtitle=f"add to {it.get('title') or 'the list'}", icon=icon("add", "accent"),
+                                  verb="Add", sticky=True, keep_open=True))
+        checks = live_checks(it)
+        terms = norm(text).split()
+        shown = [c for c in checks if all(t in norm(c.get("text")) for t in terms)]
+        shown.sort(key=lambda c: bool(c.get("done")))  # open ones first, in their order
+        for c in shown:
+            rows.append(self.item(
+                f"check:{c['id']}", lambda a, cid=c["id"]: self.on_check(iid, cid, a), title=c.get("text") or "",
+                icon=icon("checked" if c.get("done") else "check", it.get("color") or ""),
+                subtitle=None, badge="done" if c.get("done") else None, verb="Untick" if c.get("done") else "Tick",
+                keep_open=True,
+                actions=[{"title": "Delete", "id": "delete", "icon": "edit-delete", "keep_open": True}]))
+        if not text:
+            done = sum(1 for c in checks if c.get("done"))
+            if done:
+                rows.append(self.item("uncheckall", lambda _a: self.set_checks(iid, False), title="Untick everything",
+                                      subtitle=f"{done} ticked", icon="edit-undo", keep_open=True, verb="Untick"))
+            if it.get("due") and not it.get("done"):
+                rows.append(self.item("completelist", lambda _a: (self.on_item(iid, "complete"), self.go(""))[1],
+                                      title="Complete the list", subtitle=" · ".join(self.when_bits(it, today)),
+                                      icon=icon("done", it.get("color") or "green"), keep_open=True, verb="Done"))
+            rows.append(self.item("weblist", lambda _a: self.open_web(iid), title="Open in Jot",
+                                  icon="internet-web-browser", verb="Open"))
+        if not shown and not text:
+            rows.insert(0, {"title": "No checks yet", "subtitle": "Type one to add it", "icon": "edit-find",
+                            "sticky": True})
+        return rows
+
+    def when_view(self, q, today, minute):
+        iid, _, rest = q[5:].partition(" " + WHEN_SEP)
+        it = self.jot.items.get(iid)
+        if not it:
+            self.set_scope(None)
+            return [{"title": "That item is gone", "icon": "dialog-error", "sticky": True, "set_query": ""}]
+        self.set_scope(f"when:{iid} {WHEN_SEP}", "When: " + (it.get("title") or "Untitled"))
+        text = rest.strip()
+        if not text:
+            cur = human_due(it.get("due"), today) if it.get("due") else "no date"
+            examples = ["tomorrow 9am", "fri 18:00", "in 3 days", "next week", "every mon 8:00", "29.12."]
+            return [{"title": "Type when", "subtitle": f"now {cur} · e.g. " + ", ".join(examples),
+                     "icon": "appointment-new", "sticky": True}]
+        due, repeat, ok = parse_when(text, today, minute)
+        if not ok or not due:
+            return [{"title": "Not a date I know", "subtitle": "e.g. tomorrow 9am, fri 18:00, in 3 days, every mon",
+                     "icon": "dialog-question", "sticky": True}]
+        bits = [human_due(due, today)] + ([human_repeat(repeat)] if repeat else [])
+        return [self.item("setwhen", lambda _a: (self.set_when(iid, due, repeat), self.go(""))[1],
+                          title=" · ".join(bits), subtitle=it.get("title") or "", icon="appointment-new", verb="Set",
+                          sticky=True, keep_open=True)]
+
+    def signin_rows(self):
+        return [self.item("signin", lambda _a: self.spawn_login(), title="Sign in to Jot",
+                          subtitle=self.cfg["server"], icon="dialog-password", verb="Sign in", sticky=True)]
+
+    def set_scope(self, match, label=None):
+        sc = {"match": match, "label": label} if match else None
+        if sc != self.scope:
+            self.scope = sc
+            self.emit({"scope": sc})
+
+    # ── actions ───────────────────────────────────────────────────────────────
+    def remember(self, label, iid):
+        prev = self.jot.items.get(iid)
+        if prev:
+            self.undo = (label, json.loads(json.dumps(prev)))
+
+    def do_undo(self):
+        if not self.undo:
+            return
+        label, before = self.undo
+        self.undo = None
+        cur = self.jot.items.get(before["id"]) or before
+        restore = {k: before.get(k) for k in [f for fs in GROUPS.values() for f in fs] + ["checks"] if k in before}
+        nxt = stamped(cur, dict(cur, **restore), now_ms())
+        self.notice = self.jot.put(nxt)
+
+    def on_item(self, iid, act):
+        it = self.jot.items.get(iid)
+        if not it:
+            return
+        title = it.get("title") or "Untitled"
+        today, minute = now_parts()
+        is_task = bool(it.get("due")) and not it.get("done")
+        if act is None:
+            if it.get("kind") == "list":
+                return self.open_list(iid)
+            if is_task:
+                act = "complete"
+            elif it.get("done"):
+                act = "undone"
+            else:
+                return self.open_web(iid)
+        err = None
+        if act == "complete":
+            self.remember(f"completed {title}", iid)
+            nxt, err = self.jot.change(iid, **complete_fields(it, today, minute, now_ms()))
+            if nxt and not nxt.get("done"):
+                self.notice = f"{title} — next: {human_due(nxt['due'], today)}"
+        elif act == "undone":
+            self.remember(f"reopened {title}", iid)
+            _, err = self.jot.change(iid, done=False, doneAt=0)
+        elif act == "snooze":
+            t = datetime.now() + timedelta(minutes=SNOOZE_MIN)
+            t -= timedelta(minutes=t.minute % 5)
+            until = t.strftime("%Y-%m-%dT%H:%M")
+            self.remember(f"snoozed {title}", iid)
+            _, err = self.jot.change(iid, snoozedUntil=until)
+            self.notice = f"{title}: reminds you again at {until[11:]}"
+        elif act in ("tomorrow", "nextweek"):
+            p = parse_due(it["due"])
+            day = today + 1 if act == "tomorrow" else next_weekday(today, 0)
+            self.remember(f"moved {title}", iid)
+            _, err = self.jot.change(iid, due=fmt_due(day, p[1] if p else None), snoozedUntil="")
+        elif act == "nodate":
+            self.remember(f"removed the date of {title}", iid)
+            _, err = self.jot.change(iid, due="", snoozedUntil="", repeat=None)
+        elif act == "when":
+            return self.go(f"when:{iid} {WHEN_SEP}", "When: " + title)
+        elif act == "pin":
+            _, err = self.jot.change(iid, pinned=not it.get("pinned"))
+        elif act == "archive":
+            self.remember(f"{'unarchived' if it.get('archived') else 'archived'} {title}", iid)
+            _, err = self.jot.change(iid, archived=not it.get("archived"), pinned=False)
+        elif act == "trash":
+            self.remember(f"trashed {title}", iid)
+            _, err = self.jot.change(iid, trashedAt=now_ms())
+        elif act == "copy":
+            text = "\n".join([title] + ([it["body"]] if it.get("body") else [])
+                             + [("[x] " if c.get("done") else "[ ] ") + (c.get("text") or "") for c in live_checks(it)])
+            copy(text)
+        elif act == "web":
+            self.open_web(iid)
+        self.notice = err or self.notice
+
+    def open_list(self, iid):
+        it = self.jot.items.get(iid) or {}
+        return self.go(f"list:{iid} {LIST_SEP}", it.get("title") or "Checklist")
+
+    def go(self, q, label=None):
+        """Navigate: the pill first, so the new view never flashes its raw query."""
+        if label:
+            self.set_scope(q, label)
+        else:
+            self.set_scope(None)
+        self.emit({"set_query": q})
+        return "nav"
+
+    def open_web(self, iid):
+        subprocess.Popen(["xdg-open", f"{self.cfg['server']}/#/item/{iid}"], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+    def on_check(self, iid, cid, act):
+        it = self.jot.items.get(iid)
+        if not it:
+            return
+        checks = []
+        for c in it.get("checks") or []:
+            if c.get("id") == cid:
+                c = {"id": cid, "deleted": True} if act == "delete" else dict(c, done=not c.get("done"))
+            checks.append(c)
+        _, self.notice = self.jot.change(iid, checks=checks)
+
+    def set_checks(self, iid, done):
+        it = self.jot.items.get(iid)
+        if it:
+            self.remember("unticked everything", iid)
+            checks = [c if c.get("deleted") else dict(c, done=done) for c in it.get("checks") or []]
+            _, self.notice = self.jot.change(iid, checks=checks)
+
+    def add_check(self, iid, text):
+        it = self.jot.items.get(iid)
+        self.go(f"list:{iid} {LIST_SEP}", it.get("title") or "Checklist") if it else None
+        if it:
+            checks = list(it.get("checks") or [])
+            # new ones go after the open ones, before the ticked
+            pos = max((i + 1 for i, c in enumerate(checks) if not c.get("deleted") and not c.get("done")), default=0)
+            checks.insert(pos, {"id": short_id(), "text": text, "done": False, "indent": 0})
+            _, self.notice = self.jot.change(iid, checks=checks, kind="list")
+        return "nav"
+
+    def set_when(self, iid, due, repeat):
+        it = self.jot.items.get(iid)
+        if it:
+            self.remember(f"rescheduled {it.get('title') or 'Untitled'}", iid)
+            fields = {"due": due, "snoozedUntil": "", "done": False}
+            if repeat is not None:
+                fields["repeat"] = repeat
+            _, self.notice = self.jot.change(iid, **fields)
+
+    def capture(self, text, act):
+        today, minute = now_parts()
+        if act == "literal":
+            it = new_item({"title": text})
+        else:
+            p = quickadd(text, today, minute)
+            fields = {k: p[k] for k in ("title", "kind", "labels", "due", "repeat", "pinned")}
+            fields["checks"] = p["checks"]
+            it = new_item(fields)
+        err = self.jot.put(it)
+        if act == "more":
+            self.notice = err or f"Added {it['title']}"
+            return self.go("")
+        if err:  # doit has closed; say it where it can be seen
+            notify(it["title"], err)
+
+    def spawn_login(self):
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "--login"], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+    # ── loop ──────────────────────────────────────────────────────────────────
+    def show(self, q):
+        rows = self.view(q)
+        if self.notice != self.shown_notice:
+            self.shown_notice = self.notice
+            self.emit({"message": self.notice})
+        self.emit({"items": rows})
+        if self.thumbs_wanted:
+            wanted, self.thumbs_wanted = list(self.thumbs_wanted), set()
+            threading.Thread(target=self.fetch_thumbs, args=(wanted,), daemon=True).start()
+
+    def fetch_thumbs(self, ids):
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(6) as pool:
+            got = list(pool.map(self.jot.thumbnail, ids))
+        if any(got):
+            self.refresh()
+
+    def refresh(self):
+        with self.refresh_lock:
+            self.show(self.query)
+
+    def background_sync(self):
+        try:
+            if self.jot.sync():
+                self.refresh()
+        except AuthError:
+            self.jot.token = None
+            self.refresh()
+            return
+        except OSError as e:
+            self.notice = f"Offline: {e}" if not self.jot.items else None
+            self.refresh()
+        threading.Thread(target=self.jot.events, args=(self.on_server_change,), daemon=True).start()
+
+    def on_server_change(self):
+        try:
+            if self.jot.sync():
+                self.refresh()
+        except (OSError, AuthError):
+            pass
+
+    def run(self):
+        self.emit({"activations": True, "live": True, "prompt": "jot",
+                   "placeholder": "Jot something down, or search…"})
+        if self.jot.token:
+            threading.Thread(target=self.background_sync, daemon=True).start()
+        for line in sys.stdin:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            q = msg.get("query", "")
+            if "activate" in msg:
+                a = msg["activate"]
+                fn = self.handlers.get(a.get("id"))
+                if fn:
+                    self.notice = None
+                    try:
+                        if fn(a.get("action")) == "nav":
+                            continue  # the new query brings the view
+                    except (OSError, AuthError) as e:
+                        self.notice = f"Jot said no: {e}"
+            self.query = q
+            with self.refresh_lock:
+                self.show(q)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Odds and ends
+# ═════════════════════════════════════════════════════════════════════════════
+
+def copy(text):
+    try:
+        subprocess.run(["wl-copy"], input=text.encode(), timeout=3, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def notify(title, body):
+    try:
+        subprocess.Popen(["notify-send", "-a", "Jot", "-i", "checkbox-checked-symbolic", title, body],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
+def ask(prompt, placeholder, password=False, query=""):
+    """One line from the user, through doit itself."""
+    cmd = ["doit", "-d", "-l", "0", "-p", prompt, "--no-exec", "--placeholder", placeholder]
+    if password:
+        cmd.append("--password")
+    if query:
+        cmd += ["-q", query]
+    r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    return r.stdout.rstrip("\n") if r.returncode == 0 else None
+
+
+def login(cfg):
+    jot = Jot(cfg["server"])
+    user = cfg.get("username") or ask("Jot", f"Username on {cfg['server'].split('://')[-1]}")
+    if not user:
+        return 1
+    for attempt in range(3):
+        pw = ask("Jot", f"Password for {user}" if not attempt else "Wrong password, try again", password=True)
+        if not pw:
+            return 1
+        try:
+            jot.login(user, pw)
+        except AuthError:
+            continue
+        except OSError as e:
+            notify("Jot", f"Couldn't sign in: {e}")
+            return 1
+        os.execvp("doit", ["doit", "-P", json.dumps(os.path.abspath(__file__)), "-p", "jot", "--no-custom"])
+    notify("Jot", "Wrong username or password")
+    return 1
+
+
+def main():
+    args = sys.argv[1:]
+    cfg = load_config()
+    if args[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    if not cfg.get("server"):
+        print(json.dumps({"title": "Jot isn't set up", "subtitle": f"Put server = \"https://…\" in {CONFIG}",
+                          "icon": "dialog-error"}))
+        return 0
+    if args[:1] == ["--login"]:
+        return login(cfg)
+    if args[:1] == ["--logout"]:
+        Jot(cfg["server"]).logout()
+        return 0
+    if args[:1] == ["--launch"]:
+        os.execvp("doit", ["doit", "-P", json.dumps(os.path.abspath(__file__)), "-p", "jot", "--no-custom"] + args[1:])
+    try:
+        Mode(cfg).run()
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

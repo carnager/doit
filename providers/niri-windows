@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""doit window switcher for niri.
+
+Talks to niri's IPC socket directly: the list is live (windows opening,
+closing, retitling or turning urgent update it while it's open), and actions
+take effect without spawning anything.
+
+  Windows in most-recently-used order, the focused one first. Each has its
+  app's icon and name, its workspace (and output, with several), and whether
+  it's floating or urgent. Type to filter by title, app or workspace.
+
+  Enter     focus
+  Tab       close (stays open) · bring to this workspace · float/tile ·
+            fullscreen · move to another workspace or output
+
+As a launcher mode:
+
+  [[provider]]
+  name = "windows"
+  exec = "~/.config/doit/providers/niri-windows"
+  prefix = "w "
+
+As Alt+Tab (hold Alt, tap Tab to cycle, release to switch; a quick tap goes
+back to the previous window; hold a moment without cycling and let go to
+search instead), in niri's config:
+
+  binds {
+      Alt+Tab       { spawn "~/.config/doit/providers/niri-windows" "--switcher"; }
+      Alt+Shift+Tab { spawn "~/.config/doit/providers/niri-windows" "--switcher" "prev"; }
+      Mod+W { spawn "~/.config/doit/providers/niri-windows" "--launch"; }
+  }
+"""
+
+import json
+import os
+import socket
+import sys
+import threading
+
+# ── niri IPC ─────────────────────────────────────────────────────────────────
+
+def niri_connect():
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(os.environ["NIRI_SOCKET"])
+    return s, s.makefile("rwb")
+
+
+def action(**act):
+    """One action over its own connection; returns niri's error, if any."""
+    s, f = niri_connect()
+    try:
+        f.write((json.dumps({"Action": act}) + "\n").encode())
+        f.flush()
+        reply = json.loads(f.readline() or b"{}")
+        return reply.get("Err")
+    finally:
+        s.close()
+
+
+# ── app names and icons from desktop entries ─────────────────────────────────
+
+def desktop_index():
+    """Three app_id lookups, strongest first: desktop file id, StartupWMClass,
+    executable name. Hidden (NoDisplay) entries only count for the first."""
+    dirs = [os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")]
+    dirs += (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":")
+    by_id, by_class, by_exec = {}, {}, {}
+    for d in reversed(dirs):  # earlier dirs win, so they're written last
+        for base, _, files in os.walk(os.path.join(d, "applications")):
+            for fn in files:
+                if not fn.endswith(".desktop"):
+                    continue
+                entry = {}
+                try:
+                    with open(os.path.join(base, fn), encoding="utf-8", errors="replace") as fh:
+                        section = None
+                        for line in fh:
+                            line = line.strip()
+                            if line.startswith("["):
+                                section = line
+                            elif section == "[Desktop Entry]" and "=" in line:
+                                k, v = line.split("=", 1)
+                                entry.setdefault(k.strip(), v.strip())
+                except OSError:
+                    continue
+                if entry.get("Type") != "Application" or "Name" not in entry:
+                    continue
+                info = (entry["Name"], entry.get("Icon"))
+                by_id[fn[:-8].lower()] = info
+                if entry.get("NoDisplay") == "true" or entry.get("Hidden") == "true":
+                    continue
+                if entry.get("StartupWMClass"):
+                    by_class[entry["StartupWMClass"].lower()] = info
+                exe = entry.get("Exec", "").split()
+                if exe:
+                    by_exec[os.path.basename(exe[0].strip('"')).lower()] = info
+    return (by_id, by_class, by_exec)
+
+
+def app_info(app_id, index):
+    if not app_id:
+        return ("Unknown", "application-x-executable")
+    a = app_id.lower()
+    for table in index:
+        for key in (a, a.rsplit(".", 1)[-1], a.replace(" ", "-")):
+            if key in table:
+                name, icon = table[key]
+                return (name, icon or app_id)
+    return (app_id.rsplit(".", 1)[-1].replace("-", " ").title(), app_id)
+
+
+# ── the mode ─────────────────────────────────────────────────────────────────
+
+class Switcher:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.windows = {}
+        self.workspaces = {}
+        self.focused = None
+        self.apps = desktop_index()
+        self.ready = threading.Event()
+
+    def emit(self, *objs):
+        with self.lock:
+            for o in objs:
+                sys.stdout.write(json.dumps(o, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+
+    # live state from niri's event stream
+    def follow(self):
+        s, f = niri_connect()
+        f.write(b'"EventStream"\n')
+        f.flush()
+        f.readline()  # {"Ok":"Handled"}
+        for line in f:
+            ev = json.loads(line)
+            (kind, data), = ev.items()
+            changed = True
+            if kind == "WindowsChanged":
+                self.windows = {w["id"]: w for w in data["windows"]}
+                self.focused = next((w["id"] for w in data["windows"] if w.get("is_focused")), self.focused)
+            elif kind == "WindowOpenedOrChanged":
+                w = data["window"]
+                self.windows[w["id"]] = w
+                if w.get("is_focused"):
+                    self.focused = w["id"]
+            elif kind == "WindowClosed":
+                self.windows.pop(data["id"], None)
+            elif kind == "WindowFocusChanged":
+                self.focused = data.get("id")
+            elif kind == "WindowUrgencyChanged":
+                if data["id"] in self.windows:
+                    self.windows[data["id"]]["is_urgent"] = data["urgent"]
+            elif kind == "WindowFocusTimestampChanged":
+                if data["id"] in self.windows:
+                    self.windows[data["id"]]["focus_timestamp"] = data.get("focus_timestamp")
+            elif kind == "WorkspacesChanged":
+                self.workspaces = {w["id"]: w for w in data["workspaces"]}
+            elif kind == "WorkspaceActivated":
+                for w in self.workspaces.values():
+                    if w["id"] == data["id"]:
+                        w["is_active"], w["is_focused"] = True, data.get("focused", False)
+            else:
+                changed = False
+            if changed and self.windows:
+                self.ready.set()
+                self.emit({"items": self.items()})
+
+    # items
+    def ws_label(self, ws_id):
+        ws = self.workspaces.get(ws_id)
+        if not ws:
+            return "floating" if ws_id is None else f"workspace {ws_id}"
+        label = ws.get("name") or f"workspace {ws['idx']}"
+        if len({w.get("output") for w in self.workspaces.values()}) > 1 and ws.get("output"):
+            label += f" on {ws['output']}"
+        return label
+
+    def current_ws(self):
+        f = self.windows.get(self.focused)
+        if f and f.get("workspace_id"):
+            return f["workspace_id"]
+        return next((w["id"] for w in self.workspaces.values() if w.get("is_focused")), None)
+
+    def items(self):
+        def recency(w):
+            ts = w.get("focus_timestamp") or {}
+            return (w["id"] == self.focused, ts.get("secs", 0), ts.get("nanos", 0))
+
+        here = self.current_ws()
+        outputs = sorted({w.get("output") for w in self.workspaces.values() if w.get("output")})
+        out = []
+        for w in sorted(self.windows.values(), key=recency, reverse=True):
+            name, icon = app_info(w.get("app_id"), self.apps)
+            ws = w.get("workspace_id")
+            bits = [name, self.ws_label(ws)]
+            if w.get("is_floating"):
+                bits.append("floating")
+            badge = "urgent" if w.get("is_urgent") else ("current" if w["id"] == self.focused else None)
+            acts = [
+                {"title": "Close", "id": "close", "icon": "window-close", "keep_open": True},
+                {"title": "Tile" if w.get("is_floating") else "Float", "id": "float",
+                 "icon": "window-restore", "keep_open": True},
+                {"title": "Fullscreen", "id": "fullscreen", "icon": "view-fullscreen"},
+            ]
+            if ws != here and here is not None:
+                acts.insert(1, {"title": "Bring to this workspace", "id": "here", "icon": "go-down"})
+            for other in sorted(self.workspaces.values(), key=lambda x: (x.get("output") or "", x["idx"])):
+                if other["id"] != ws:
+                    acts.append({"title": f"Move to {self.ws_label(other['id'])}", "id": f"ws:{other['id']}",
+                                 "icon": "go-jump", "keep_open": True})
+            for o in outputs:
+                if o != (self.workspaces.get(ws) or {}).get("output"):
+                    acts.append({"title": f"Move to output {o}", "id": f"out:{o}", "icon": "video-display",
+                                 "keep_open": True})
+            out.append({
+                "id": str(w["id"]), "title": w.get("title") or name, "subtitle": " · ".join(bits),
+                "icon": icon, "badge": badge, "keywords": [name, w.get("app_id") or "", self.ws_label(ws)],
+                "verb": "Focus", "actions": acts,
+            })
+        return out
+
+    def activate(self, wid, act):
+        wid = int(wid)
+        if act is None:
+            return action(FocusWindow={"id": wid})
+        if act == "close":
+            return action(CloseWindow={"id": wid})
+        if act == "float":
+            return action(ToggleWindowFloating={"id": wid})
+        if act == "fullscreen":
+            action(FocusWindow={"id": wid})
+            return action(FullscreenWindow={"id": wid})
+        if act == "here":
+            return action(MoveWindowToWorkspace={"window_id": wid, "reference": {"Id": self.current_ws()},
+                                                 "focus": True})
+        if act.startswith("ws:"):
+            return action(MoveWindowToWorkspace={"window_id": wid, "reference": {"Id": int(act[3:])}, "focus": False})
+        if act.startswith("out:"):
+            return action(MoveWindowToMonitor={"id": wid, "output": act[4:]})
+        return None
+
+    def run(self):
+        self.emit({"activations": True, "placeholder": "Switch to a window…"})
+        threading.Thread(target=self.follow, daemon=True).start()
+        for line in sys.stdin:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if "activate" in msg:
+                a = msg["activate"]
+                if a.get("id"):
+                    err = self.activate(a["id"], a.get("action"))
+                    if err:
+                        self.emit({"message": f"niri: {err}"})
+
+
+def main():
+    args = sys.argv[1:]
+    me = os.path.abspath(__file__)
+    base = ["doit", "-P", json.dumps(me), "-p", "windows", "--no-custom"]
+    if args[:1] == ["--switcher"]:
+        os.execvp("doit", base + ["--switcher", *(args[1:2] or ["next"])])
+    elif args[:1] == ["--launch"]:
+        os.execvp("doit", base + args[1:])
+    elif args[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+    else:
+        if "NIRI_SOCKET" not in os.environ:
+            print(json.dumps({"title": "niri is not running", "icon": "dialog-error"}))
+            return
+        try:
+            Switcher().run()
+        except (BrokenPipeError, KeyboardInterrupt):
+            pass
+
+
+if __name__ == "__main__":
+    main()

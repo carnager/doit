@@ -1,0 +1,705 @@
+#!/usr/bin/env python3
+"""doit mode for Melody (https://github.com/carnager/melody).
+
+Talks to melodyd directly (newline-delimited JSON-RPC), no melody-cli.
+
+  Empty query   now playing (with cover) and transport controls, the
+                speaker in use, the newest albums
+  words         commands, albums, artists and tracks, live, with covers
+  artist:NAME   that artist's albums, and shuffling all of them
+  speakers      where to play
+  rate 4.5      rate the playing track in stars (rate album 4: its album)
+
+  Enter         play (an album; a track plays its album from there)
+  Tab           add to queue · add to Up Next · rate
+  Controls stay open, like a remote.
+
+Engine: --server HOST:PORT | --local, else $MELODY_SERVER, else this
+computer's socket. Password: --password-file, $MELODY_PASSWORD,
+$MELODY_PASSWORD_FILE.
+
+  [[provider]]
+  name = "melody"
+  exec = "~/.config/doit/providers/melody"
+  prefix = "m "
+  live = true
+  icon = "multimedia-audio-player"
+"""
+
+import base64
+import hashlib
+import json
+import os
+import queue
+import random
+import socket
+import sys
+import threading
+import uuid
+
+COVER_PX = 128
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "doit", "melody")
+ALBUMS, ARTISTS, TRACKS = 8, 3, 8
+
+
+def b64(text):
+    return base64.b64encode(text.encode()).decode()
+
+
+def unb64(text):
+    try:
+        return base64.b64decode(text).decode(errors="replace")
+    except ValueError:
+        return ""
+
+
+def clock(ms):
+    if ms is None or ms < 0:
+        return ""
+    s = int(ms // 1000)
+    return f"{s // 3600}:{s // 60 % 60:02}:{s % 60:02}" if s >= 3600 else f"{s // 60}:{s % 60:02}"
+
+
+def stars(rating):
+    # Ratings are 0-10, i.e. half stars.
+    return "★" * (rating // 2) + ("½" if rating % 2 else "") if rating else None
+
+
+DEFAULT_PORT = 6603
+
+
+def count(n, noun):
+    """1 track, 2 tracks."""
+    return f"{n} {noun}{'' if n == 1 else 's'}"
+
+
+def split_host(server):
+    """HOST, HOST:PORT, [V6] or [V6]:PORT; the port defaults to Melody's 6603."""
+    if server.startswith("["):
+        host, _, rest = server[1:].partition("]")
+        return host, int(rest[1:]) if rest.startswith(":") and rest[1:].isdigit() else DEFAULT_PORT
+    host, sep, port = server.rpartition(":")
+    if sep and port.isdigit() and ":" not in host:
+        return host, int(port)
+    return server, DEFAULT_PORT
+
+
+# ── engine ───────────────────────────────────────────────────────────────────
+
+class EngineError(Exception):
+    pass
+
+
+class Engine:
+    def __init__(self, opts):
+        self.opts = opts
+        self.lock = threading.Lock()
+        self.next_id = 0
+        self.f = None
+
+    def _connect(self):
+        server, local = self.opts.get("server") or os.environ.get("MELODY_SERVER"), self.opts.get("local")
+        if server and not local and not server.startswith("/"):
+            host, port = split_host(server)
+            sock = socket.create_connection((host, port), timeout=5)
+        else:
+            path = server if server and not local else os.path.join(
+                os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "melodyd.sock")
+            sock = socket.socket(socket.AF_UNIX)
+            sock.settimeout(5)
+            sock.connect(path)
+        self.sock, self.f = sock, sock.makefile("rwb")
+        password = self._password()
+        if password and not (server is None or server.startswith("/") or local):
+            self._call("session.authenticate", {"password": password})
+
+    def is_here(self):
+        """Is the engine on this computer: a unix socket, or a server address
+        that is this host or a loopback?"""
+        server, local = self.opts.get("server") or os.environ.get("MELODY_SERVER"), self.opts.get("local")
+        if local or not server or server.startswith("/"):
+            return True
+        host = split_host(server)[0].lower()
+        if host in ("localhost", socket.gethostname().lower()) or host.startswith("127.") or host == "::1":
+            return True
+        try:  # an address of this host's own: the connection's two ends are one
+            return self.sock.getpeername()[0] == self.sock.getsockname()[0]
+        except (AttributeError, OSError):
+            return False
+
+    def _password(self):
+        if os.environ.get("MELODY_PASSWORD"):
+            return os.environ["MELODY_PASSWORD"]
+        path = self.opts.get("password_file") or os.environ.get("MELODY_PASSWORD_FILE")
+        if path:
+            with open(os.path.expanduser(path)) as fh:
+                return fh.read().strip()
+        return None
+
+    def _send(self, method, params):
+        self.next_id += 1
+        msg = {"id": self.next_id, "method": method, "params": params or {}}
+        self.f.write((json.dumps(msg) + "\n").encode())
+        return self.next_id
+
+    def _recv(self, ids):
+        answers = {}
+        while len(answers) < len(ids):
+            line = self.f.readline()
+            if not line:
+                raise EngineError("the engine closed the connection")
+            msg = json.loads(line)
+            if msg.get("id") in ids:  # notifications have no id
+                answers[msg["id"]] = msg
+        out = []
+        for i in ids:
+            m = answers[i]
+            if "error" in m:
+                raise EngineError(m["error"].get("message", "engine error"))
+            out.append(m.get("result"))
+        return out
+
+    def _call(self, method, params=None):
+        i = self._send(method, params)
+        self.f.flush()
+        return self._recv([i])[0]
+
+    def many(self, calls):
+        """Pipelined: all requests go out before any answer is awaited."""
+        with self.lock:
+            for attempt in (0, 1):
+                try:
+                    if self.f is None:
+                        self._connect()
+                    ids = [self._send(m, p) for m, p in calls]
+                    self.f.flush()
+                    return self._recv(ids)
+                except (OSError, ValueError) as e:
+                    self.f = None
+                    if attempt:
+                        raise EngineError(str(e)) from e
+
+    def call(self, method, params=None):
+        return self.many([(method, params)])[0]
+
+
+# ── covers ───────────────────────────────────────────────────────────────────
+
+class Covers:
+    """Album covers on disk, fetched in the background on a second connection."""
+
+    def __init__(self, opts, on_new):
+        self.engine = Engine(opts)
+        self.on_new = on_new
+        self.todo = queue.Queue()
+        self.pending = set()
+        os.makedirs(CACHE, exist_ok=True)
+        threading.Thread(target=self._run, daemon=True).start()
+
+    @staticmethod
+    def _file(key):
+        return os.path.join(CACHE, hashlib.sha1(key.encode()).hexdigest()[:20])
+
+    def icon(self, key, params, fallback):
+        """Path of the cached cover, or `fallback` while it is fetched."""
+        f = self._file(key)
+        if os.path.exists(f + ".jpg"):
+            return f + ".jpg"
+        if not os.path.exists(f + ".none") and key not in self.pending:
+            self.pending.add(key)
+            self.todo.put((key, params))
+        return fallback
+
+    def _run(self):
+        while True:
+            batch = [self.todo.get()]
+            while not self.todo.empty() and len(batch) < 16:
+                batch.append(self.todo.get())
+            try:
+                answers = self.engine.many(
+                    [("catalogue.artwork", dict(p, size=COVER_PX)) for _, p in batch])
+            except EngineError:
+                answers = [None] * len(batch)
+            for (key, _), a in zip(batch, answers):
+                f = self._file(key)
+                img = base64.b64decode(a["image"]) if a and a.get("image") else b""
+                with open(f + (".jpg" if img else ".none"), "wb") as fh:
+                    fh.write(img)
+                self.pending.discard(key)
+            self.on_new()
+
+
+# ── the mode ─────────────────────────────────────────────────────────────────
+
+class Mode:
+    def __init__(self, opts):
+        self.engine = Engine(opts)
+        self.out_lock = threading.Lock()
+        self.state_lock = threading.Lock()
+        self.query = None
+        self.view = None  # (query, raw data) last shown, re-rendered when covers arrive
+        self.handlers = {}  # item id -> callable(action); returning "nav" skips the refresh
+        self.rate_targets = {}  # rating view query -> what it rates
+        self.shown_query = ""
+        self.covers = Covers(opts, self.redraw)
+
+    # output
+    def emit(self, obj):
+        with self.out_lock:
+            sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+
+    def redraw(self):
+        with self.state_lock:
+            if self.view is not None:
+                self.emit({"items": self.render(*self.view)})
+
+    def show(self, q):
+        try:
+            data = self.fetch(q)
+        except EngineError as e:
+            self.view = None
+            self.emit({"items": [{
+                "title": "Melody's engine is not reachable", "subtitle": str(e),
+                "icon": "dialog-error", "sticky": True}]})
+            return
+        with self.state_lock:
+            if q != self.query:
+                return  # a newer query is on its way
+            self.view = (q, data)
+            self.emit({"items": self.render(q, data)})
+
+    # data
+    def fetch(self, q):
+        q = q.strip()
+        if q in self.rate_targets:
+            return {"rate": self.rate_targets[q]}
+        if not q:
+            state, np, newest, outs = self.engine.many([
+                ("playback.state", {}),
+                ("playback.now_playing", {}),
+                ("catalogue.query", {"kind": 1, "text": "", "limit": 6, "newest_first": True}),
+                ("outputs.list", {}),
+            ])
+            fav, lib = None, None
+            if state.get("path"):
+                fav_answer, lib = self.engine.many([
+                    ("favorites.state", {"paths": [state["path"]]}),
+                    ("catalogue.query", {"kind": 2, "text": "", "path": state["path"], "limit": 1})])
+                fav = fav_answer["favorites"][0]
+                lib = (lib["entries"] or [None])[0]
+            return {"home": True, "state": state, "np": (np or {}).get("track"), "newest": newest["entries"],
+                    "outputs": outs["outputs"], "fav": fav, "lib": lib}
+        if q.lower().startswith("artist:"):
+            name = q[7:].strip()
+            albums = self.engine.call("catalogue.query", {"kind": 1, "text": "", "artist": b64(name), "limit": 200})
+            return {"artist": name, "albums": albums["entries"]}
+        if q.lower() in ("speakers", "speaker", "outputs", "output"):
+            return {"speakers": self.engine.call("outputs.list")["outputs"]}
+        albums, artists, tracks, outs, rules, lists, state = self.engine.many([
+            ("catalogue.query", {"kind": 1, "text": q, "limit": ALBUMS}),
+            ("catalogue.query", {"kind": 0, "text": q, "limit": ARTISTS}),
+            ("catalogue.query", {"kind": 2, "text": q, "limit": TRACKS}),
+            ("outputs.list", {}),
+            ("dynamic.rules", {}),
+            ("list.all", {}),
+            ("playback.state", {}),
+        ])
+        lib = None
+        if q.lower().split()[0] == "rate" and state.get("path"):
+            lib = (self.engine.call("catalogue.query", {"kind": 2, "text": "", "path": state["path"],
+                                                        "limit": 1})["entries"] or [None])[0]
+        return {"albums": albums["entries"], "artists": artists["entries"], "tracks": tracks["entries"],
+                "outputs": outs["outputs"], "rules": rules["rules"], "lists": lists["lists"], "state": state,
+                "lib": lib}
+
+    # items
+    def render(self, q, d):
+        self.handlers = {}
+        self.shown_query = q
+        if "rate" in d:
+            return self.rating_view(d["rate"])
+        if d.get("home"):
+            return self.home(d)
+        if "artist" in d:
+            return self.artist_view(d)
+        if "speakers" in d:
+            return [self.speaker(o) for o in d["speakers"]]
+        ql = q.strip().lower()
+        exact = [a for a in d["artists"] if (a.get("label") or "").lower() == ql]
+        others = [a for a in d["artists"] if a not in exact]
+        # An album by the artist typed outranks one that merely mentions it.
+        albums = sorted(d["albums"], key=lambda a: ((a.get("label") or "").lower() != ql,
+                                                    (a.get("artist") or "").lower() != ql))
+        items = self.commands(q, d)
+        items += [self.artist(a) for a in exact]
+        items += [self.album(a) for a in albums]
+        items += [self.artist(a) for a in others]
+        items += [self.track(t) for t in d["tracks"]]
+        if not items:
+            items = [{"title": "Nothing found", "subtitle": f"for “{q}”", "icon": "edit-find", "sticky": True}]
+        return items
+
+    def item(self, iid, handler, **fields):
+        self.handlers[iid] = handler
+        return {"id": iid, **fields}
+
+    def remote(self, method, params=None):
+        return lambda _action: self.engine.call(method, params or {})
+
+    def home(self, d):
+        st, np, items = d["state"], d["np"], []
+        playing = st.get("status") == "playing"
+        if np:
+            sub = np.get("artist") or ""
+            if np.get("album"):
+                sub += f" — {np['album']}" + (f" ({np['date'][:4]})" if np.get("date") else "")
+            pos = f"{clock(st.get('position_ms'))} / {clock(st.get('duration_ms'))}"
+            if d.get("lib") and d["lib"].get("rating"):
+                sub = f"{stars(d['lib']['rating'])}  {sub}"
+            items.append(self.item(
+                "np", self.np_action,
+                title=np.get("title") or "Unknown title", subtitle=sub,
+                icon=self.cover_for_path(np.get("path"), "multimedia-audio-player"),
+                badge=pos if playing else f"paused · {pos}",
+                verb="Pause" if playing else "Play", keep_open=True,
+                actions=[
+                    {"title": "Next track", "id": "next", "icon": "media-skip-forward", "keep_open": True},
+                    {"title": "Previous track", "id": "prev", "icon": "media-skip-backward", "keep_open": True},
+                    {"title": "Remove from Favorites" if d["fav"] else "Add to Favorites", "id": "fav",
+                     "icon": "emblem-favorite", "keep_open": True},
+                    {"title": "Stop", "id": "stop", "icon": "media-playback-stop", "keep_open": True},
+                ] + self.track_rate_actions(d.get("lib"))))
+        elif st.get("queue_size"):
+            items.append(self.item("np", self.remote("playback.resume"), title="Nothing playing",
+                                   subtitle=f"{count(st['queue_size'], 'track')} queued", icon="media-playback-start",
+                                   verb="Play", keep_open=True))
+        items.append(self.item("cmd:next", self.remote("playback.next"), title="Next track",
+                               icon="media-skip-forward", verb="Skip", keep_open=True))
+        items.append(self.item("cmd:prev", self.remote("playback.previous"), title="Previous track",
+                               icon="media-skip-backward", verb="Back", keep_open=True))
+        vol = st.get("volume_percent", 0)
+        items.append(self.item(
+            "cmd:vol", lambda a: self.engine.call("playback.set_volume", {
+                "percent": max(0, min(100, vol + (-5 if a == "down" else 5)))}),
+            title=f"Volume {vol}%", subtitle="type “vol 40” to set it", verb="Louder",
+            icon="audio-volume-high" if vol > 66 else "audio-volume-medium" if vol > 33 else "audio-volume-low",
+            keep_open=True,
+            actions=[{"title": "Quieter", "id": "down", "icon": "audio-volume-low", "keep_open": True}]))
+        sel = next((o for o in d["outputs"] if o.get("selected")), None)
+        if sel and len(d["outputs"]) > 1:
+            items.append({"id": "nav:speakers", "title": f"Playing on {sel['name']}",
+                          "subtitle": "choose a speaker", "icon": "audio-speakers",
+                          "set_query": "speakers", "verb": "Choose"})
+        items += [dict(self.album(a), badge="new") for a in d["newest"]]
+        return items
+
+    def np_action(self, action):
+        if action == "next":
+            self.engine.call("playback.next")
+        elif action == "prev":
+            self.engine.call("playback.previous")
+        elif action == "stop":
+            self.engine.call("playback.stop")
+        elif action == "fav":
+            st = self.engine.call("playback.state")
+            on = self.engine.call("favorites.state", {"paths": [st["path"]]})["favorites"][0]
+            self.engine.call("favorites.toggle", {"favorite": not on})
+        else:
+            st = self.engine.call("playback.state")
+            self.engine.call("playback.pause" if st.get("status") == "playing" else "playback.resume")
+
+    def cover_for_path(self, path, fallback):
+        if not path:
+            return fallback
+        folder = os.path.dirname(unb64(path))
+        return self.covers.icon("dir:" + folder, {"path": path}, fallback)
+
+    # ratings: 0-10 in the engine, half stars to people
+    def rate_action(self, album, rating_hash, label, current):
+        """A Tab action opening the rating view, or None if this can't be rated."""
+        if not rating_hash:
+            return None
+        view = f"rate {'album' if album else 'track'}: {label}"
+        self.rate_targets[view] = {"hash": rating_hash, "album": album, "label": label,
+                                   "current": current or 0, "back": self.shown_query}
+        return {"title": f"Rate {'album' if album else 'track'}…" + (f"  {stars(current)}" if current else ""),
+                "id": "rate-album" if album else "rate-track", "icon": "starred", "set_query": view}
+
+    def rating_view(self, t):
+        items = []
+        for v in range(10, 0, -1):
+            items.append(self.item(
+                f"rating:{v}", lambda _a, v=v: self.rate(t, v),
+                title=stars(v), subtitle=f"{v / 2:g} of 5" + (" · current" if v == t["current"] else ""),
+                icon="starred" if v % 2 == 0 else "semi-starred", verb="Rate", keep_open=True,
+                badge="current" if v == t["current"] else None))
+        items.append(self.item("rating:0", lambda _a: self.rate(t, 0), title="Clear rating",
+                               subtitle=t["label"], icon="non-starred", verb="Clear", keep_open=True))
+        return items
+
+    def rate(self, t, value):
+        self.engine.call("catalogue.set_rating", {"hash": t["hash"], "album": t["album"], "rating": value})
+        t["current"] = value
+        self.emit({"set_query": t["back"]})  # back to where the rating was asked for
+        return "nav"
+
+    QUEUE_ACTIONS = [
+        {"title": "Add to queue", "id": "add", "icon": "list-add"},
+        {"title": "Add to Up Next", "id": "upnext", "icon": "go-last"},
+    ]
+
+    def album(self, a):
+        bits = [a.get("artist"), (a.get("date") or "")[:4], count(a['tracks'], 'track') if a.get("tracks") else None]
+        return self.item(
+            "album:" + a["key"], lambda act, key=a["key"]: self.place(act, self.album_tracks(key)),
+            title=a.get("label") or a.get("album") or "Unknown album",
+            subtitle=" · ".join(b for b in bits if b),
+            icon=self.covers.icon("album:" + a["key"], {"album_key": a["key"]}, "media-optical"),
+            badge=stars(a.get("album_rating") or 0) or "album", verb="Play",
+            actions=self.QUEUE_ACTIONS + [x for x in [self.rate_action(
+                True, a.get("album_rating_hash") or a.get("rating_hash"),
+                f"{a.get('label') or a.get('album')} — {a.get('artist') or '?'}", a.get("album_rating"))] if x])
+
+    def artist(self, a):
+        n = a.get("albums") or 0
+        return {"id": "artist:" + a["key"], "title": a.get("label") or unb64(a["key"]),
+                "subtitle": f"{count(n, 'album')} · {count(a.get('tracks', 0), 'track')}",
+                "icon": "avatar-default", "badge": "artist", "verb": "Albums",
+                "set_query": "artist:" + (a.get("label") or unb64(a["key"]))}
+
+    def track(self, t):
+        sub = t.get("artist") or ""
+        if t.get("album"):
+            sub += f" — {t['album']}" + (f" ({t['date'][:4]})" if t.get("date") else "")
+        if t.get("duration_ms", -1) >= 0:
+            sub += f" · {clock(t['duration_ms'])}"
+        return self.item(
+            "track:" + t["key"], lambda act, t=t: self.play_track(act, t),
+            title=t.get("title") or t.get("label") or unb64(t["key"]).rsplit("/", 1)[-1],
+            subtitle=sub, icon=self.cover_for_path(t["key"], "audio-x-generic"),
+            badge=stars(t.get("rating") or 0) or "track", verb="Play",
+            actions=self.QUEUE_ACTIONS + self.track_rate_actions(t))
+
+    def track_rate_actions(self, t):
+        if not t:
+            return []
+        title = t.get("title") or t.get("label") or "?"
+        return [x for x in [
+            self.rate_action(False, t.get("rating_hash"), f"{title} — {t.get('artist') or '?'}", t.get("rating")),
+            self.rate_action(True, t.get("album_rating_hash"),
+                             f"{t.get('album') or '?'} — {t.get('artist') or '?'}", t.get("album_rating")),
+        ] if x]
+
+    def artist_view(self, d):
+        name, albums = d["artist"], d["albums"]
+        items = []
+        if albums:
+            items.append(self.item(
+                "shuffle:" + name, lambda _a: self.shuffle_artist(name),
+                title=f"Shuffle {name}", subtitle=f"every track of {count(len(albums), 'album')}",
+                icon="media-playlist-shuffle", verb="Play"))
+        items += [self.album(a) for a in sorted(albums, key=lambda a: a.get("date") or "")]
+        return items or [{"title": f"No albums by {name}", "icon": "edit-find", "sticky": True}]
+
+    def speaker(self, o):
+        # The engine's "local" output is local to the engine, which is only
+        # this computer when the engine runs here; an agent named after this
+        # host is this computer's.
+        here = o["name"].lower() == socket.gethostname().lower() if not o.get("local") else self.engine.is_here()
+        where = "this computer" if here else "the engine's own speakers" if o.get("local") else (
+            "network speaker" if o.get("online") else "offline")
+        return self.item(
+            "out:" + o["id"], lambda _a, oid=o["id"]: self.engine.call("outputs.select", {"id": oid}),
+            title=o["name"], subtitle=f"playing · {where}" if o.get("selected") else where,
+            icon="computer" if here else "audio-speakers" if o.get("local") else "network-wireless",
+            badge="✓" if o.get("selected") else None, verb="Play on it", keep_open=True)
+
+    def commands(self, q, d):
+        words = q.lower().split()
+
+        def hit(*names):
+            text = " ".join(n.lower() for n in names if n)
+            return all(w in text for w in words)
+
+        out = []
+        if words[0] in ("vol", "volume") and len(words) == 2 and words[1].isdigit():
+            pct = max(0, min(100, int(words[1])))
+            out.append(self.item(f"cmd:setvol:{pct}", lambda _a: self.engine.call("playback.set_volume", {"percent": pct}),
+                                 title=f"Set volume to {pct}%", icon="audio-volume-medium", verb="Set", keep_open=True))
+        if words[0] == "rate" and d.get("lib"):
+            album = len(words) > 1 and words[1] == "album"
+            num = words[2 if album else 1] if len(words) > (2 if album else 1) else None
+            lib = d["lib"]
+            try:
+                value = round(float(num.replace(",", ".")) * 2) if num is not None else None
+            except ValueError:
+                value = None
+            target = {"hash": lib.get("album_rating_hash" if album else "rating_hash"), "album": album,
+                      "label": lib.get("album") if album else lib.get("title"),
+                      "current": lib.get("album_rating" if album else "rating") or 0, "back": ""}
+            if target["hash"] and value is not None and 0 <= value <= 10:
+                out.append(self.item(
+                    f"cmd:rate:{album}:{value}", lambda _a, t=target, v=value: self.rate(t, v),
+                    title=(f"Rate {'album' if album else 'track'} {stars(value)}" if value else
+                           f"Clear the {'album' if album else 'track'}'s rating"),
+                    subtitle=target["label"], icon="starred", verb="Rate", keep_open=True, badge="rating"))
+            elif target["hash"]:
+                for alb, key, label in ((False, "rating_hash", lib.get("title")), (True, "album_rating_hash", lib.get("album"))):
+                    act = self.rate_action(alb, lib.get(key), f"{label} — {lib.get('artist') or '?'}",
+                                           lib.get("album_rating" if alb else "rating"))
+                    if act and (not album or alb):
+                        out.append({"id": "nav:" + act["id"], "title": f"Rate the playing {'album' if alb else 'track'}",
+                                    "subtitle": f"{label}" + (f" · now {stars(lib.get('album_rating' if alb else 'rating'))}"
+                                                              if lib.get("album_rating" if alb else "rating") else ""),
+                                    "icon": "starred", "set_query": act["set_query"], "verb": "Rate", "badge": "rating"})
+        fixed = [
+            ("cmd:toggle", "Play / Pause", "media-playback-start", "toggle resume", "Toggle", self.np_action),
+            ("cmd:next", "Next track", "media-skip-forward", "skip", "Skip", self.remote("playback.next")),
+            ("cmd:prev", "Previous track", "media-skip-backward", "back", "Back", self.remote("playback.previous")),
+            ("cmd:stop", "Stop", "media-playback-stop", "", "Stop", self.remote("playback.stop")),
+            ("cmd:fav", "Favorite the playing track", "emblem-favorite", "love like heart", "Toggle",
+             lambda _a: self.np_action("fav")),
+            ("cmd:random", "Shuffle " + ("off" if d["state"].get("modes", {}).get("random") else "on"),
+             "media-playlist-shuffle", "random", "Switch",
+             lambda _a: self.engine.call("playback.set_modes", {
+                 "random": not self.engine.call("playback.state").get("modes", {}).get("random")})),
+        ]
+        for iid, title, icon, kw, verb, fn in fixed:
+            if hit(title, kw):
+                out.append(self.item(iid, fn, title=title, icon=icon, keep_open=True, badge="control", verb=verb))
+        for o in d["outputs"]:
+            if not o.get("selected") and o.get("online", True) and hit("play on speaker output", o["name"]):
+                out.append(dict(self.speaker(o), title=f"Play on {o['name']}", badge="speaker"))
+        for r in d["rules"]:
+            if hit(r["name"], "dynamic playlist"):
+                out.append(self.item("dyn:" + r["id"], lambda _a, rid=r["id"]: self.play_rule(rid),
+                                     title=r["name"], subtitle="dynamic playlist", icon="media-playlist-shuffle",
+                                     badge="dynamic", verb="Play"))
+        for pl in d["lists"]:
+            if pl.get("kind") == "saved" and hit(pl["name"], "playlist"):
+                out.append(self.item("list:" + pl["id"], lambda _a, lid=pl["id"]: self.engine.call("list.play", {"id": lid}),
+                                     title=pl["name"], subtitle="playlist", icon="view-media-playlist",
+                                     badge="playlist", verb="Play"))
+        return out[:6]
+
+    # queueing
+    def album_tracks(self, key):
+        return self.engine.call("catalogue.query", {"kind": 2, "text": "", "album_key": key, "limit": 5000})["entries"]
+
+    @staticmethod
+    def entries(tracks):
+        out = []
+        for t in tracks:
+            e = {"entry": str(uuid.uuid4()), "path": t["key"], "title": t.get("title") or t.get("label") or "",
+                 "group": {"album_artist": t.get("artist", ""), "artist": t.get("artist", ""),
+                           "album": t.get("album", ""), "date": t.get("date", "")}}
+            if t.get("duration_ms", -1) >= 0:
+                e["duration_ms"] = t["duration_ms"]
+            out.append(e)
+        return out
+
+    def place(self, how, tracks, start=0):
+        entries = self.entries(tracks)
+        if not entries:
+            return
+        how = how or "play"
+        if how == "play":
+            self.engine.call("playback.replace_queue", {"entries": entries})
+            self.engine.call("playback.play", {"entry": entries[start]["entry"]})
+        elif how == "add":
+            held = self.engine.call("playback.queue").get("entries", [])
+            self.engine.call("playback.replace_queue", {"entries": held + entries})
+        else:  # Up Next: held by the engine, then asked for in order
+            self.engine.call("playback.enqueue", {"entries": entries})
+            asked = self.engine.call("playback.requests").get("entries", [])
+            ids = [e["entry"] for e in entries]
+            self.engine.call("playback.set_requests", {"entries": asked + ids})
+
+    def play_track(self, how, t):
+        if how:
+            return self.place(how, [t])
+        # Enter: the whole album, starting at this track.
+        album = self.engine.call("catalogue.query", {"kind": 1, "text": "", "path": t["key"], "limit": 1})["entries"]
+        tracks = self.album_tracks(album[0]["key"]) if album else [t]
+        start = next((i for i, x in enumerate(tracks) if x["key"] == t["key"]), 0)
+        self.place("play", tracks if start < len(tracks) else [t], start)
+
+    # The engine evaluates a rule over the whole library (about two seconds);
+    # the shipped random ones are a random catalogue query or two instead,
+    # as melody-cli does: an album of a random album artist (an artist with
+    # forty albums no likelier than one with one), or random tracks.
+    def play_rule(self, rid):
+        if rid == "shipped:random-album":
+            return self.random_album()
+        if rid == "shipped:random-tracks":
+            return self.place("play", self.random_query({"kind": 2, "limit": 50}))
+        return self.engine.call("dynamic.play", {"id": rid})
+
+    def random_query(self, params):
+        return self.engine.call("catalogue.query", dict(params, text="", random=True, offset=0))["entries"]
+
+    def random_album(self):
+        artist = self.random_query({"kind": 0, "limit": 1})
+        album = artist and self.random_query({"kind": 1, "artist": artist[0]["key"], "limit": 1})
+        if not album:
+            return self.engine.call("dynamic.play", {"id": "shipped:random-album"})
+        self.place("play", self.album_tracks(album[0]["key"]))
+
+    def shuffle_artist(self, name):
+        tracks = self.engine.call("catalogue.query", {"kind": 2, "text": "", "artist": b64(name), "limit": 5000})["entries"]
+        random.shuffle(tracks)
+        self.place("play", tracks)
+
+    # loop
+    def activate(self, iid, action, q):
+        fn = self.handlers.get(iid)
+        if fn is None and iid and iid.startswith("cmd:"):
+            fn = {"cmd:next": self.remote("playback.next"), "cmd:prev": self.remote("playback.previous")}.get(iid)
+        if fn:
+            try:
+                if fn(action) == "nav":
+                    return  # doit navigates; the new query brings the refresh
+            except EngineError as e:
+                self.emit({"items": [{"title": "Melody said no", "subtitle": str(e), "icon": "dialog-error",
+                                      "sticky": True}]})
+                return
+        self.query = q
+        self.show(q)  # refresh (keep_open items stay on screen)
+
+    def run(self):
+        self.emit({"activations": True, "placeholder": "Search albums, artists, tracks…", "prompt": "melody"})
+        for line in sys.stdin:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            q = msg.get("query", "")
+            if "activate" in msg:
+                a = msg["activate"]
+                self.activate(a.get("id"), a.get("action"), q)
+            else:
+                self.query = q
+                self.show(q)
+
+
+def parse_args(argv):
+    opts, it = {}, iter(argv)
+    for a in it:
+        if a == "--server":
+            opts["server"] = next(it, None)
+        elif a == "--local":
+            opts["local"] = True
+        elif a == "--password-file":
+            opts["password_file"] = next(it, None)
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            sys.exit(0)
+    return opts
+
+
+if __name__ == "__main__":
+    try:
+        Mode(parse_args(sys.argv[1:])).run()
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass

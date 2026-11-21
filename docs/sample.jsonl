@@ -1,0 +1,8 @@
+{"title":"Firefox","subtitle":"Browse the World Wide Web","icon":"firefox","badge":"app"}
+{"title":"Files","subtitle":"Access and organize files","icon":"org.gnome.Nautilus","badge":"app"}
+{"title":"Foot","subtitle":"A Wayland native terminal emulator","icon":"foot","badge":"app"}
+{"title":"File Roller","subtitle":"Create and modify an archive","icon":"org.gnome.FileRoller","badge":"app"}
+{"title":"Font Viewer","subtitle":"View fonts on your system","icon":"org.gnome.font-viewer","badge":"app"}
+{"title":"Shut down","icon":"system-shutdown","badge":"power"}
+{"title":"Settings","subtitle":"Configure your system","icon":"preferences-system","badge":"app"}
+{"title":"Calculator","subtitle":"Perform arithmetic calculations","icon":"accessories-calculator","badge":"app"}

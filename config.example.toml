@@ -1,0 +1,63 @@
+# ~/.config/doit/config.toml
+
+# Built-in: midnight, daylight, nord, gruvbox — or a file in ~/.config/doit/themes/.
+# "auto" (the default) follows the system's light/dark preference:
+theme = "auto"
+theme_light = "daylight"
+theme_dark = "midnight"
+
+# Modes used when `doit` runs without -m. Providers with a prefix are always
+# available through their prefix.
+modes = ["apps"]
+
+# Frecency ranking for launched items.
+frecency = true
+
+# Terminal for Terminal=true apps. Default: $TERMINAL, then common terminals.
+# terminal = "foot"
+
+# Prepend to every launch, e.g. to let the compositor own the process:
+# launch_prefix = ["niri", "msg", "action", "spawn", "--"]
+
+# Inline theme overrides (merged over the theme above):
+# [theme]
+# position = "top"
+# top_offset = 0.2
+# width = 720
+# rows = 9
+# font = "Inter"
+# icon_theme = "Papirus-Dark"
+# colors.accent = "#ff8fab"
+
+[[provider]]
+name = "calc"
+exec = "~/.config/doit/providers/calc"
+prefix = "="
+live = true
+
+[[provider]]
+name = "windows"
+exec = "~/.config/doit/providers/niri-windows"
+prefix = "w "
+
+[[provider]]
+name = "power"
+exec = "~/.config/doit/providers/power"
+prefix = "!"
+
+[[provider]]
+name = "melody"
+exec = "~/.config/doit/providers/melody"
+prefix = "m "
+live = true
+icon = "multimedia-audio-player"
+
+[[provider]]
+name = "popcorn"
+exec = "~/.config/doit/providers/popcorn"
+prefix = "v "
+
+[[provider]]
+name = "jot"
+exec = "~/.config/doit/providers/jot"
+prefix = "j "
