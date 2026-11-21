@@ -288,7 +288,7 @@ impl Renderer {
 
     /// Load icons for the visible rows in parallel (only first sighting is slow).
     fn prefetch_icons(&mut self, names: Vec<String>, w: u32, h: u32) {
-        let missing: Vec<String> = names.into_iter().filter(|n| !self.icons.is_cached(n, w, h)).collect();
+        let missing: Vec<String> = names.into_iter().filter(|n| !n.starts_with("text:") && !self.icons.is_cached(n, w, h)).collect();
         if missing.len() < 2 {
             return;
         }
@@ -305,8 +305,14 @@ impl Renderer {
         }
     }
 
-    /// An icon, or a letter tile with a stable color per title.
+    /// An icon, a character (`text:😀`), or a letter tile with a stable color per title.
     fn draw_icon(&mut self, pm: &mut Pixmap, fam: &str, s: f32, name: Option<&str>, title: &str, x: f32, y: f32, size: f32, h: f32, t: &Theme) {
+        if let Some(glyph) = name.and_then(|n| n.strip_prefix("text:")) {
+            let spec = TextSpec { text: glyph, size: size.min(h) * 0.8, weight: Weight::NORMAL, color: t.colors.text, hl: &[], hl_color: t.colors.text };
+            let gw = self.measure(fam, &spec);
+            self.text(pm, fam, s, &spec, x + (size - gw) / 2.0, y + h / 2.0, size.max(gw));
+            return;
+        }
         let (pw, ph) = ((size * s).round() as u32, (h * s).round() as u32);
         if let Some(ip) = name.and_then(|n| self.icons.get(n, pw, ph)).cloned() {
             pm.draw_pixmap((x * s).round() as i32, (y * s).round() as i32, ip.as_ref(), &Default::default(), Transform::identity(), None);
@@ -481,7 +487,7 @@ impl Renderer {
                 for (i, a) in st.actions_for(*item).into_iter().enumerate() {
                     rows.push(Row {
                         title: a.title,
-                        subtitle: a.exec.clone(),
+                        subtitle: a.subtitle.clone().or_else(|| a.exec.clone()).filter(|s| !s.is_empty()),
                         icon: a.icon,
                         badge: (i == 0).then(|| "↵".to_string()),
                         hl: vec![],

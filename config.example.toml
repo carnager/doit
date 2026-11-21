@@ -61,3 +61,8 @@ prefix = "v "
 name = "jot"
 exec = "~/.config/doit/providers/jot"
 prefix = "j "
+
+[[provider]]
+name = "emoji"
+exec = "~/.config/doit/providers/emoji"
+prefix = ":"

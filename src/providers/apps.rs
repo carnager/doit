@@ -204,8 +204,7 @@ fn parse(path: &Path, id: &str, loc: &Locale, desktops: &[String], path_dirs: &[
                 exec: Some(shell_join(&argv)),
                 icon: g.get("Icon").cloned().or_else(|| icon.clone()),
                 id: Some(a.clone()),
-                keep_open: false,
-                set_query: None,
+                ..Default::default()
             });
         }
     }

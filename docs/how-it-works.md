@@ -121,11 +121,11 @@ Every field except `title` is optional.
 |---|---|---|
 | `title` | string | main text, fuzzy matched |
 | `subtitle` | string | second line, matched with lower weight |
-| `icon` | string | icon-theme name or absolute path (svg/png) |
+| `icon` | string | icon-theme name, absolute path (svg/png), or `text:…` to draw a character (an emoji) |
 | `keywords` | [string] | hidden match terms |
 | `exec` | string | shell command run on activation; without it the item is printed |
 | `terminal` | bool | run `exec` in your terminal |
-| `actions` | [{title, exec?, icon?, id?}] | secondary actions (Tab) |
+| `actions` | [{title, exec?, subtitle?, icon?, id?}] | secondary actions (Tab); `subtitle` defaults to the command, `""` hides it |
 | `badge` | string | small label on the right |
 | `id` | string | stable identity for frecency and `-f id` |
 | `sticky` | bool | never filtered out |
@@ -174,7 +174,7 @@ Static providers can just print items and exit. Live providers set
 does the matching.
 
 Examples in [`providers/`](../providers): `calc` (live), `niri-windows` (live, Alt+Tab), `power`,
-`melody`, `popcorn` and `jot`.
+`emoji`, `melody`, `popcorn` and `jot`.
 
 ### niri-windows
 
@@ -199,6 +199,22 @@ binds {
     Alt+Shift+Tab { spawn "~/.config/doit/providers/niri-windows" "--switcher" "prev"; }
 }
 ```
+
+### emoji
+
+Every emoji from Unicode's list, with CLDR's names and keywords, so `ok` finds
+👍 and `party` finds 🎉. Prefix `:`, or `emoji --launch`:
+
+- **Enter** types it into the window you came from (with `wtype`; without it,
+  or with `--copy`, Enter copies). **Tab** copies, and lists the skin tones.
+- **Several at once:** separate words with ` :`. `:smile :tada :rock` turns the
+  first words into their best match (😀🎉), and each row offers a different
+  last one. Enter types the whole sequence.
+- **Your language:** names and keywords follow `$LANG`, or
+  `--lang de,fr` in `exec`. English keywords always match too.
+
+The data is downloaded once (about 3 MB) to `~/.cache/doit/emoji` and checked
+again every two months.
 
 ### popcorn
 

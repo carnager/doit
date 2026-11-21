@@ -9,6 +9,9 @@ pub struct Action {
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exec: Option<String>,
+    /// Second line; defaults to the command. `""` shows none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

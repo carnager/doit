@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""doit emoji picker.
+
+Every emoji from Unicode's own list, named and searchable in your language
+with CLDR's keywords ("thumbs up" also finds "ok", "like", "yes"). The data is
+downloaded once and cached under ~/.cache/doit/emoji.
+
+  Enter     type it into the focused window (wtype), or copy it without wtype
+  Tab       copy · skin tones
+
+Several at once: separate words with " :", e.g. ":smile :tada :rocket".
+The earlier words take their best match; the rows offer choices for the last
+one, and Enter types the whole sequence.
+
+  [[provider]]
+  name = "emoji"
+  exec = "~/.config/doit/providers/emoji"
+  prefix = ":"
+
+Options (append them to exec):
+
+  --lang de,fr   names and keywords in these languages (default: from $LANG);
+                 English keywords always match too
+  --copy         Enter copies; typing becomes the action
+  --launch       open doit with just this picker
+"""
+
+import json
+import os
+import re
+import shlex
+import shutil
+import sys
+import time
+import urllib.request
+
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "doit", "emoji")
+TEST = "https://unicode.org/Public/emoji/latest/emoji-test.txt"
+CLDR = "https://cdn.jsdelivr.net/npm/cldr-annotations-full/annotations/{}/annotations.json"
+CLDR_DERIVED = "https://cdn.jsdelivr.net/npm/cldr-annotations-derived-full/annotationsDerived/{}/annotations.json"
+MAX_AGE = 60 * 86400
+TONES = {chr(c) for c in range(0x1F3FB, 0x1F400)}
+
+
+def fetch(url, name):
+    """A cached download; refreshed when old, the old copy kept when offline."""
+    path = os.path.join(CACHE, name)
+    fresh = os.path.exists(path) and time.time() - os.path.getmtime(path) < MAX_AGE
+    if not fresh:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "doit-emoji"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = r.read()
+            os.makedirs(CACHE, exist_ok=True)
+            with open(path + ".tmp", "wb") as f:
+                f.write(data)
+            os.replace(path + ".tmp", path)
+        except OSError:
+            if not os.path.exists(path):
+                return None
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def annotations(lang):
+    out = {}
+    for url, key in ((CLDR, "annotations"), (CLDR_DERIVED, "annotationsDerived")):
+        raw = fetch(url.format(lang), f"{key}-{lang}.json")
+        if raw:
+            try:
+                out.update(json.loads(raw)[key]["annotations"])
+            except (ValueError, KeyError):
+                pass
+    return out
+
+
+def parse_test(text):
+    """(emoji, english name, group) for every fully-qualified emoji, in order."""
+    group = ""
+    for line in text.splitlines():
+        if line.startswith("# group:"):
+            group = line.split(":", 1)[1].strip()
+        elif line and not line.startswith("#") and "; fully-qualified" in line:
+            _, _, rest = line.partition("#")
+            emoji, _, rest = rest.strip().partition(" ")
+            name = rest.split(" ", 1)[1] if rest.startswith("E") else rest
+            if group != "Component":
+                yield emoji, name, group
+
+
+def build(langs):
+    raw = fetch(TEST, "emoji-test.txt")
+    if not raw:
+        return None
+    notes = [annotations(lang) for lang in langs]
+    english = notes[langs.index("en")] if "en" in langs else annotations("en")
+
+    def name_of(e, fallback):
+        for n in notes:
+            tts = (n.get(e) or n.get(e.replace("️", "")) or {}).get("tts")
+            if tts:
+                return tts[0]
+        return fallback
+
+    def words_of(e):
+        out = []
+        for n in notes + [english]:
+            out += (n.get(e) or n.get(e.replace("️", "")) or {}).get("default", [])
+        return list(dict.fromkeys(out))
+
+    items, by_base = [], {}
+    for e, name, group in parse_test(raw.decode("utf-8")):
+        base = "".join(c for c in e if c not in TONES)
+        if base != e and items:
+            # Toned forms follow their base; some (🫱🏻‍🫲🏿 after 🤝) aren't spelled like it.
+            by_base.get(base, items[-1])["tones"].append([e, name_of(e, name)])
+            continue
+        item = {"e": e, "name": name_of(e, name), "en": name, "group": group, "words": words_of(e), "tones": []}
+        by_base[e] = item
+        items.append(item)
+    return items
+
+
+def load(langs):
+    path = os.path.join(CACHE, f"items-{'-'.join(langs)}.json")
+    try:
+        if time.time() - os.path.getmtime(path) < MAX_AGE:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+    except (OSError, ValueError):
+        pass
+    items = build(langs)
+    if items:
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False)
+        os.replace(path + ".tmp", path)
+    return items
+
+
+def commands(e, copy_first):
+    q = shlex.quote(e)
+    copy = f"printf %s {q} | wl-copy"
+    # A moment's pause, so the keystrokes reach the window doit hands focus back to.
+    type_ = f"wtype -s 120 -- {q}" if shutil.which("wtype") else None
+    return (copy, type_) if copy_first or not type_ else (type_, copy)
+
+
+def cap(s):
+    return s[:1].upper() + s[1:]
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return
+    if "--launch" in args:
+        rest = [a for a in args if a != "--launch"]
+        me = shlex.join([os.path.abspath(__file__), *rest])
+        os.execvp("doit", ["doit", "-P", me, "-p", "emoji", "--placeholder", "Pick an emoji…", "--no-custom"])
+    copy_first = "--copy" in args
+    langs = []
+    if "--lang" in args and args.index("--lang") + 1 < len(args):
+        langs = [l.strip() for l in args[args.index("--lang") + 1].split(",") if l.strip()]
+    if not langs:
+        lang = (os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or "en").split(".")[0]
+        lang = lang.split("_")[0]
+        langs = [lang if lang.isalpha() and lang not in ("C", "POSIX") else "en"]
+
+    if not os.path.exists(os.path.join(CACHE, f"items-{'-'.join(langs)}.json")):
+        print(json.dumps({"message": "Downloading emoji data…"}), flush=True)
+    items = load(langs)
+    if not items:
+        print(json.dumps({"message": None}))
+        print(json.dumps({"title": "Couldn't download the emoji list", "subtitle": TEST,
+                          "icon": "dialog-error", "sticky": True}))
+        return
+    print(json.dumps({"placeholder": "Pick an emoji…  (several: smile :tada :rocket)", "message": None}))
+    full = {"items": [row(it, copy_first) for it in items]}
+    emit(full)
+    shown_full = True
+    for line in sys.stdin:
+        try:
+            q = json.loads(line).get("query")
+        except (ValueError, AttributeError):
+            continue
+        if q is None:
+            continue
+        words = [w.strip().replace("_", " ") for w in re.split(r"(?:^|\s+):", q)]
+        if len([w for w in words if w]) >= 2 or (len(words) >= 2 and words[0]):
+            emit({"items": several(items, words, copy_first)})
+            shown_full = False
+        elif not shown_full:
+            emit(full)
+            shown_full = True
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def row(it, copy_first):
+    e = it["e"]
+    enter, other = commands(e, copy_first)
+    acts = []
+    if other:
+        acts.append({"title": "Type it" if copy_first else "Copy", "exec": other, "subtitle": "",
+                     "icon": "input-keyboard" if copy_first else "edit-copy"})
+    for te, tname in it["tones"]:
+        acts.append({"title": cap(tname.split(": ", 1)[-1]), "exec": commands(te, copy_first)[0],
+                     "subtitle": "", "icon": f"text:{te}"})
+    return {
+        "id": e, "title": cap(it["name"]), "icon": f"text:{e}",
+        "subtitle": ", ".join(w for w in it["words"] if w.lower() != it["name"].lower())[:90] or it["group"],
+        "keywords": [it["en"], it["group"], *it["words"]], "exec": enter,
+        "verb": verb(enter), "badge": "skin tones" if it["tones"] else None, "actions": acts,
+    }
+
+
+def verb(cmd):
+    return "Copy" if cmd.endswith("wl-copy") else "Type"
+
+
+def lookup(items, word, n):
+    """The n best emoji for one word: a pasted emoji, then exact names and
+    keywords, then prefixes, then substrings; ties keep Unicode's order."""
+    w = word.lower()
+    if not w:
+        return []
+    scored = []
+    for k, it in enumerate(items):
+        if it["e"] == word:
+            return [it]
+        names = [it["name"].lower(), it["en"].lower()]
+        kws = [x.lower() for x in it["words"]]
+        if w in names:
+            s = 0
+        elif w in kws:
+            s = 1
+        elif any(x.startswith(w) for x in names):
+            s = 2
+        elif any(x.startswith(w) for x in kws) or any(p.startswith(w) for x in names for p in x.split()):
+            s = 3
+        elif any(w in x for x in names + kws):
+            s = 4
+        else:
+            continue
+        scored.append((s, k, it))
+    scored.sort(key=lambda t: t[:2])
+    return [it for _, _, it in scored[:n]]
+
+
+def several(items, words, copy_first):
+    """Rows for `smile :tada :thu`: the earlier words resolve to their best
+    match, each row offers a different emoji for the last one."""
+    head, missing = [], []
+    for w in words[:-1]:
+        hit = lookup(items, w, 1)
+        (head.append(hit[0]) if hit else missing.append(w)) if w else None
+    tails = lookup(items, words[-1], 12) or [None]
+    note = f"  ·  nothing for {', '.join(repr(m) for m in missing)}" if missing else ""
+    out = []
+    for n, tail in enumerate(tails):
+        seq = head + ([tail] if tail else [])
+        if not seq:
+            continue
+        text = "".join(it["e"] for it in seq)
+        enter, other = commands(text, copy_first)
+        acts = [{"title": "Type it" if copy_first else "Copy", "exec": other, "subtitle": "",
+                 "icon": "input-keyboard" if copy_first else "edit-copy"}] if other else []
+        out.append({
+            "id": f"seq:{text}", "title": f"{text}   {cap(tail['name']) if tail else ''}".rstrip(),
+            "subtitle": " · ".join(cap(it["name"]) for it in seq) + note,
+            "icon": f"text:{(tail or seq[-1])['e']}", "exec": enter, "verb": verb(enter),
+            "sticky": True, "bias": -n, "actions": acts,
+        })
+    return out or [{"title": "No emoji for that", "subtitle": note.strip(" ·"), "icon": "dialog-question",
+                    "sticky": True}]
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
