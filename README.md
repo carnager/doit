@@ -56,3 +56,7 @@ providers along (in `/usr/lib/doit/providers`) and the example config at
 
 **[How it works →](docs/how-it-works.md)** Keys, flags, the item format, the
 provider protocol, the bundled modes and theming.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
