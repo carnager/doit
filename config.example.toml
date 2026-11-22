@@ -29,40 +29,44 @@ frecency = true
 # icon_theme = "Papirus-Dark"
 # colors.accent = "#ff8fab"
 
+# Providers: `exec` is a shell command. Bare names are looked up in
+# ~/.config/doit/providers, then /usr/lib/doit/providers (the bundled ones,
+# from the package), then $PATH.
+
 [[provider]]
 name = "calc"
-exec = "~/.config/doit/providers/calc"
+exec = "calc"
 prefix = "="
 live = true
 
 [[provider]]
 name = "windows"
-exec = "~/.config/doit/providers/niri-windows"
+exec = "niri-windows"
 prefix = "w "
 
 [[provider]]
 name = "power"
-exec = "~/.config/doit/providers/power"
+exec = "power"
 prefix = "!"
 
 [[provider]]
 name = "melody"
-exec = "~/.config/doit/providers/melody"
+exec = "melody"
 prefix = "m "
 live = true
 icon = "multimedia-audio-player"
 
 [[provider]]
 name = "popcorn"
-exec = "~/.config/doit/providers/popcorn"
+exec = "popcorn"
 prefix = "v "
 
 [[provider]]
 name = "jot"
-exec = "~/.config/doit/providers/jot"
+exec = "jot"
 prefix = "j "
 
 [[provider]]
 name = "emoji"
-exec = "~/.config/doit/providers/emoji"
+exec = "emoji"
 prefix = ":"

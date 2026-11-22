@@ -1,0 +1,54 @@
+# Maintainer: Rasmus Steinke <rasi@xssn.at>
+pkgname=doit-git
+pkgver=r0.g0000000
+pkgrel=1
+pkgdesc='A rofi for the next millennium: a Wayland launcher with structured items and live providers'
+arch=(x86_64 aarch64)
+url='https://github.com/carnager/doit'
+license=(unknown)
+depends=(gcc-libs glibc libxkbcommon)
+makedepends=(cargo git)
+optdepends=('python: the bundled providers (calc, emoji, niri windows, melody, popcorn, jot)'
+            'wtype: emoji types into the focused window'
+            'wl-clipboard: copying from calc, emoji and jot'
+            'noto-fonts-emoji: color emoji'
+            'mpv: popcorn playback')
+provides=(doit)
+conflicts=(doit)
+source=("doit::git+https://github.com/carnager/doit.git")
+sha256sums=('SKIP')
+options=(!lto)
+
+pkgver() {
+  cd doit
+  printf 'r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd doit
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd doit
+  export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd doit
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen --release
+}
+
+package() {
+  cd doit
+  install -Dm755 target/release/doit "$pkgdir/usr/bin/doit"
+  for p in providers/*; do
+    install -Dm755 "$p" "$pkgdir/usr/lib/doit/providers/${p#providers/}"
+  done
+  install -Dm644 config.example.toml "$pkgdir/usr/share/doc/$pkgname/config.example.toml"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 docs/how-it-works.md "$pkgdir/usr/share/doc/$pkgname/how-it-works.md"
+}

@@ -42,14 +42,17 @@ Type a prefix to switch mode; backspace leaves it.
 
 <img src="docs/emoji.png" width="60%">
 
-The modes live in [`providers/`](providers). To use them, copy them and the
-example config:
+The modes live in [`providers/`](providers). To turn them on, start from the
+example config; from a checkout, copy the providers too:
 
 ```sh
-mkdir -p ~/.config/doit/providers
-cp providers/* ~/.config/doit/providers/
 cp config.example.toml ~/.config/doit/config.toml
+mkdir -p ~/.config/doit/providers && cp providers/* ~/.config/doit/providers/
 ```
+
+On Arch, `doit-git` from [repo.mooned.de](https://repo.mooned.de) brings the
+providers along (in `/usr/lib/doit/providers`) and the example config at
+`/usr/share/doc/doit-git/config.example.toml`.
 
 **[How it works →](docs/how-it-works.md)** Keys, flags, the item format, the
 provider protocol, the bundled modes and theming.

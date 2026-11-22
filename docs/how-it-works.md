@@ -138,7 +138,10 @@ Every field except `title` is optional.
 
 ## Providers
 
-A provider is any command. doit starts it once and keeps it running.
+A provider is any command. doit starts it once and keeps it running. A bare
+name in `exec` is looked up in `~/.config/doit/providers`, then
+`/usr/lib/doit/providers` (the bundled ones, when installed as a package),
+then `$PATH`.
 
 **doit → provider** (stdin), on every query change, coalesced:
 
@@ -298,7 +301,7 @@ modes = ["apps"]
 
 [[provider]]
 name = "calc"
-exec = "~/.config/doit/providers/calc"
+exec = "calc"
 prefix = "="
 live = true
 ```

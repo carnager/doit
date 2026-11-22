@@ -28,11 +28,20 @@ use std::process::{Command, Stdio};
 
 pub type Spawned = (std::sync::mpsc::Sender<ToProvider>, Option<std::thread::JoinHandle<()>>);
 
+/// Providers can be named without a path: your own in ~/.config/doit/providers
+/// come first, then the bundled ones a package installs, then $PATH.
+fn provider_path() -> std::ffi::OsString {
+    let mut dirs = vec![crate::config::config_dir().join("providers"), "/usr/lib/doit/providers".into()];
+    dirs.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+    std::env::join_paths(dirs).unwrap_or_default()
+}
+
 pub fn spawn(exec: &str, tx: Sender<SourceMsg>, idx: usize) -> Spawned {
     let (qtx, qrx) = std::sync::mpsc::channel::<ToProvider>();
     let child = Command::new("sh")
         .arg("-c")
         .arg(crate::config::expand_tilde(exec))
+        .env("PATH", provider_path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
