@@ -39,6 +39,8 @@ Type a prefix to switch mode; backspace leaves it.
 | `m ` | melody | a remote for [Melody](https://github.com/carnager/melody) |
 | `v ` | popcorn | a poster grid for [Popcorn](https://github.com/carnager/cinnamon) |
 | `j ` | jot | capture and tick off [Jot](https://github.com/carnager/jot) notes |
+| `b ` | bahn | train connections and departures from [Transitous](https://transitous.org) |
+| `wx ` | weather | now, hourly and ten days from [Open-Meteo](https://open-meteo.com) |
 
 <img src="docs/emoji.png" width="60%">
 

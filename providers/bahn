@@ -1,0 +1,707 @@
+#!/usr/bin/env python3
+"""doit mode for train connections and departures, using the open Transitous API.
+
+  empty query           bookmarked routes with their next train, then favorite
+                        stations with their next departures
+  a station             Enter picks it as the start, then type the destination
+  Köln > Berlin morgen 8
+                        straight to the connections; the time is optional
+  in the connections    type a time (18:30, morgen 8, fr 18:00, 24.12. 9)
+
+  Tab                   favorite, bookmark, reverse, departures, copy, open on
+                        bahn.de (for prices and booking)
+
+Favorites and bookmarks live in ~/.local/share/doit/bahn.json.
+
+  [[provider]]
+  name = "bahn"
+  exec = "bahn"
+  prefix = "b "
+"""
+
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from zoneinfo import ZoneInfo
+
+API = "https://api.transitous.org/api"
+AGENT = "doit-bahn-provider"
+TZ = ZoneInfo("Europe/Berlin")
+HOME = os.path.expanduser("~")
+STORE = os.path.join(os.environ.get("XDG_DATA_HOME") or f"{HOME}/.local/share", "doit", "bahn.json")
+SEP = " › "
+RAIL = {"HIGHSPEED_RAIL", "LONG_DISTANCE", "NIGHT_RAIL", "REGIONAL_RAIL", "REGIONAL_FAST_RAIL", "RAIL", "SUBURBAN"}
+ICONS = {"HIGHSPEED_RAIL": "train", "LONG_DISTANCE": "train", "NIGHT_RAIL": "train", "REGIONAL_RAIL": "train",
+         "SUBURBAN": "train", "SUBWAY": "subway", "TRAM": "tram", "BUS": "bus", "COACH": "bus", "FERRY": "ferry"}
+ICON = "text:🚆"
+GLYPHS = {"train": "🚆", "subway": "🚇", "tram": "🚋", "bus": "🚌", "ferry": "⛴"}
+requests = threading.BoundedSemaphore(4)
+
+
+# ── api ──────────────────────────────────────────────────────────────────────
+
+def get(path, **params):
+    query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+    req = urllib.request.Request(f"{API}{path}?{query}", headers={"User-Agent": AGENT, "Accept": "application/json"})
+    with requests, urllib.request.urlopen(req, timeout=20) as r:
+        return json.load(r)
+
+
+def fold(text):
+    """Compare names the way people type them: köln, koeln, Hbf, Hauptbahnhof."""
+    text = text.casefold().replace("ß", "ss")
+    text = "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
+    text = text.replace("ae", "a").replace("oe", "o").replace("ue", "u")
+    text = re.sub(r"[^\w]+", " ", text)
+    return re.sub(r"\bhbf\b", "hauptbahnhof", text).strip()
+
+
+def search_stations(text):
+    wanted = fold(text).split()
+    best = {}
+    for p in get("/v1/geocode", text=text, language="de", type="STOP"):
+        name = fold(p.get("name") or "")
+        if not name or not all(w in name for w in wanted):
+            continue
+        old = best.get(name)
+        if not old or (p.get("importance") or 0) > (old.get("importance") or 0):
+            best[name] = p
+    ranked = sorted(best.values(), key=lambda p: -(p.get("importance") or 0))
+    return [{"id": p["id"], "name": p["name"], "area": area(p)} for p in ranked[:12]]
+
+
+def area(p):
+    names = [a.get("name") for a in p.get("areas") or [] if a.get("default")]
+    return names[0] if names else ""
+
+
+def departures(stop):
+    out = get("/v5/stoptimes", stopId=stop, n=60).get("stopTimes") or []
+    rail = [s for s in out if s.get("mode") in RAIL]
+    return rail or out  # a stop only buses or trams serve
+
+
+def stable_id(stop):
+    """Search can return ids naming a yearly dataset; what we save must outlive it."""
+    times = get("/v5/stoptimes", stopId=stop, n=1).get("stopTimes") or []
+    place = times[0]["place"] if times else {}
+    return place.get("parentId") or place.get("stopId") or stop
+
+
+def connections(a, b, when=None):
+    t = when.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if when else None
+    out = get("/v5/plan", fromPlace=a, toPlace=b, time=t)
+    return {"items": out.get("itineraries") or []}
+
+
+# ── time ─────────────────────────────────────────────────────────────────────
+
+DAYS = {"mo": 0, "mon": 0, "montag": 0, "monday": 0, "di": 1, "die": 1, "dienstag": 1, "tue": 1, "tuesday": 1,
+        "mi": 2, "mit": 2, "mittwoch": 2, "wed": 2, "wednesday": 2, "do": 3, "don": 3, "donnerstag": 3, "thu": 3,
+        "thursday": 3, "fr": 4, "fri": 4, "freitag": 4, "friday": 4, "sa": 5, "sat": 5, "samstag": 5, "saturday": 5,
+        "so": 6, "son": 6, "sonntag": 6, "sun": 6, "sunday": 6}
+OFFSETS = {"heute": 0, "today": 0, "morgen": 1, "tomorrow": 1, "übermorgen": 2, "uebermorgen": 2}
+
+
+def parse_when(text, now=None):
+    """A departure time from free text, or None if it isn't one."""
+    now = now or dt.datetime.now(TZ)
+    day, clock = None, None
+    words = [w for w in text.casefold().split() if w not in ("um", "at", "uhr", "am")]
+    if not words:
+        return None
+    for w in words:
+        if w in OFFSETS and day is None:
+            day = now.date() + dt.timedelta(days=OFFSETS[w])
+        elif w in DAYS and day is None:
+            day = now.date() + dt.timedelta(days=(DAYS[w] - now.weekday() - 1) % 7 + 1)
+        elif (m := re.fullmatch(r"(\d{1,2})\.(\d{1,2})\.?(\d{2,4})?", w)) and day is None:
+            year = int(m[3]) + (2000 if len(m[3]) == 2 else 0) if m[3] else now.year
+            try:
+                day = dt.date(year, int(m[2]), int(m[1]))
+            except ValueError:
+                return None
+            if not m[3] and day < now.date():
+                day = day.replace(year=year + 1)
+        elif (m := re.fullmatch(r"(\d{1,2})(?::(\d{2}))?h?", w)) and clock is None:
+            if int(m[1]) > 23 or int(m[2] or 0) > 59:
+                return None
+            clock = dt.time(int(m[1]), int(m[2] or 0))
+        else:
+            return None
+    if day is None:
+        day = now.date()
+        if dt.datetime.combine(day, clock, TZ) < now - dt.timedelta(minutes=1):
+            day += dt.timedelta(days=1)  # "8" in the evening means tomorrow's
+    return dt.datetime.combine(day, clock or dt.time(6, 0), TZ)
+
+
+def split_when(text):
+    """'Berlin morgen 8' -> ('Berlin', 'morgen 8'). The place keeps at least a word."""
+    words = text.split()
+    for i in range(1, len(words)):
+        tail = " ".join(words[i:])
+        if parse_when(tail):
+            return " ".join(words[:i]), tail
+    return text.strip(), ""
+
+
+def stamp(iso):
+    return dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(TZ)
+
+
+def clock(iso):
+    return stamp(iso).strftime("%H:%M") if iso else "--:--"
+
+
+def delay(actual, planned):
+    if not actual or not planned:
+        return 0
+    return round((stamp(actual) - stamp(planned)).total_seconds() / 60)
+
+
+def span(seconds):
+    m = round(seconds / 60)
+    return f"{m // 60}h {m % 60:02}m" if m >= 60 else f"{m} min"
+
+
+def until(iso):
+    m = round((stamp(iso) - dt.datetime.now(TZ)).total_seconds() / 60)
+    if m <= 0:
+        return "now"
+    return f"in {m} min" if m < 60 else f"in {span(m * 60)}"
+
+
+def icon_for(mode):
+    return "text:" + GLYPHS.get(ICONS.get(mode, "train"), "🚆")
+
+
+def late(minutes):
+    return f"+{minutes}" if minutes > 0 else None
+
+
+# ── favorites and bookmarks ──────────────────────────────────────────────────
+
+class Store:
+    def __init__(self):
+        try:
+            with open(STORE) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            data = {}
+        self.stations = data.get("stations") or []
+        self.routes = data.get("routes") or []
+
+    def save(self):
+        os.makedirs(os.path.dirname(STORE), exist_ok=True)
+        tmp = STORE + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump({"stations": self.stations, "routes": self.routes}, fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, STORE)
+
+    def is_station(self, sid):
+        return any(s["id"] == sid for s in self.stations)
+
+    def toggle_station(self, sid, name):
+        if self.is_station(sid):
+            self.stations = [s for s in self.stations if s["id"] != sid]
+        else:
+            self.stations.append({"id": sid, "name": name})
+        self.save()
+
+    def is_route(self, a, b):
+        return any(r["from"]["id"] == a and r["to"]["id"] == b for r in self.routes)
+
+    def toggle_route(self, a, an, b, bn):
+        if self.is_route(a, b):
+            self.routes = [r for r in self.routes if not (r["from"]["id"] == a and r["to"]["id"] == b)]
+        else:
+            self.routes.append({"from": {"id": a, "name": an}, "to": {"id": b, "name": bn}})
+        self.save()
+
+
+# ── the mode ─────────────────────────────────────────────────────────────────
+
+class Provider:
+    def __init__(self):
+        self.store = Store()
+        self.lock = threading.RLock()
+        self.cache = {}  # key -> (fetched at, value)
+        self.loading = set()
+        self.names = {}
+        self.saved_as = {}  # id from a search -> the stable id it was saved under
+        self.trips = {}  # token -> (from, to, itinerary)
+        self.query = None
+        self.scope = self.live = self.placeholder = self.shown = False
+        for s in self.store.stations:
+            self.names[s["id"]] = s["name"]
+        for r in self.store.routes:
+            self.names[r["from"]["id"]] = r["from"]["name"]
+            self.names[r["to"]["id"]] = r["to"]["name"]
+
+    @staticmethod
+    def emit(*objs):
+        for o in objs:
+            sys.stdout.write(json.dumps(o, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+    # data: return what we have, fetch in the background, redraw when it lands
+    def want(self, key, ttl, fetch, wait=0):
+        with self.lock:
+            hit = self.cache.get(key)
+            if hit and time.time() - hit[0] < ttl:
+                return hit[1]
+            if key not in self.loading:
+                self.loading.add(key)
+                threading.Thread(target=self.load, args=(key, fetch, wait), daemon=True).start()
+            return hit[1] if hit else None
+
+    def load(self, key, fetch, wait):
+        if wait:
+            time.sleep(wait)  # typing: only ask for what's still on screen
+            with self.lock:
+                if key[1] not in (self.query or ""):
+                    self.loading.discard(key)
+                    return
+        try:
+            value = fetch()
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            value = {"error": str(getattr(e, "reason", e))}
+        with self.lock:
+            self.cache[key] = (time.time(), value)
+            self.loading.discard(key)
+            try:
+                self.render()
+            except BrokenPipeError:
+                os._exit(0)
+
+    def stations(self, text):
+        text = text.strip()
+        if len(text) < 2:
+            return []
+        found = self.want(("geo", text), 86400, lambda: search_stations(text), wait=0.15)
+        if isinstance(found, list):
+            for s in found:
+                self.names[s["id"]] = s["name"]
+        return found
+
+    def board(self, sid):
+        return self.want(("dep", sid), 30, lambda: departures(sid))
+
+    def plan(self, a, b, when=None):
+        return self.want(("plan", a, b, when.isoformat() if when else None), 60, lambda: connections(a, b, when))
+
+    # commands travel as item and action ids
+    @staticmethod
+    def cmd(*parts):
+        return json.dumps(parts, ensure_ascii=False)
+
+    def nav(self, q, label=None):
+        return self.cmd("go", q, label)
+
+    def name(self, sid):
+        return self.names.get(sid, "Station")
+
+    def saved(self, sid):
+        return self.saved_as.get(sid, sid)
+
+    def stabilize(self, sid):
+        if sid not in self.saved_as:
+            try:
+                self.saved_as[sid] = stable_id(sid)
+            except (urllib.error.URLError, OSError, ValueError, KeyError):
+                self.saved_as[sid] = sid
+            self.names.setdefault(self.saved_as[sid], self.name(sid))
+        return self.saved_as[sid]
+
+    def to_dep(self, sid):
+        return self.nav(f"dep:{sid}{SEP}", self.name(sid))
+
+    def to_dest(self, sid):
+        return self.nav(f"to:{sid}{SEP}", f"{self.name(sid)} →")
+
+    def to_trip(self, a, b, rest=""):
+        return self.nav(f"trip:{a}|{b}{SEP}{rest}", f"{self.name(a)} → {self.name(b)}")
+
+    # items
+    def station_actions(self, sid, primary):
+        acts = []
+        if primary != "dep":
+            acts.append({"title": "Departures", "id": self.to_dep(sid), "icon": "text:🕒", "subtitle": "",
+                         "keep_open": True})
+        if primary != "dest":
+            acts.append({"title": "Connections from here", "id": self.to_dest(sid), "icon": "text:➡️", "subtitle": "",
+                         "keep_open": True})
+        fav = self.store.is_station(self.saved(sid))
+        acts.append({"title": "Remove from favorites" if fav else "Add to favorites",
+                     "id": self.cmd("fav", sid), "icon": "text:⭐", "subtitle": "", "keep_open": True})
+        return acts
+
+    def next_departures(self, sid):
+        got = self.board(sid)
+        if got is None:
+            return "Loading departures…"
+        if isinstance(got, dict):
+            return "Departures unavailable"
+        now = dt.datetime.now(TZ)
+        bits = []
+        for s in got:
+            when = s["place"].get("departure")
+            if not when or stamp(when) < now or s.get("cancelled"):
+                continue
+            d = delay(when, s["place"].get("scheduledDeparture"))
+            bits.append(f"{clock(when)}{f' (+{d})' if d > 0 else ''} {s.get('displayName') or s.get('routeShortName')}")
+            if len(bits) == 3:
+                break
+        return " · ".join(bits) or "No departures soon"
+
+    def favorite_item(self, s):
+        return {"id": self.to_dep(s["id"]), "title": s["name"], "subtitle": self.next_departures(s["id"]),
+                "icon": "text:⭐", "verb": "Departures", "keep_open": True,
+                "actions": self.station_actions(s["id"], "dep")}
+
+    def next_trip(self, a, b):
+        got = self.plan(a, b)
+        if got is None:
+            return "Loading the next connection…"
+        if "error" in got:
+            return "Connections unavailable"
+        now = dt.datetime.now(TZ)
+        for it in got["items"]:
+            if stamp(it["startTime"]) >= now and not cancelled(it):
+                return f"{summary(it)} · {lines(it)}"
+        return "No connection soon"
+
+    def route_item(self, r):
+        a, b = r["from"]["id"], r["to"]["id"]
+        return {"id": self.to_trip(a, b), "title": f"{r['from']['name']} → {r['to']['name']}",
+                "subtitle": self.next_trip(a, b), "icon": "text:🔖", "verb": "Connections", "keep_open": True,
+                "actions": [{"title": "Reverse route", "id": self.to_trip(b, a), "icon": "text:🔁", "subtitle": "",
+                             "keep_open": True},
+                            {"title": "Remove bookmark", "id": self.cmd("route", a, b), "icon": "text:🔖",
+                             "subtitle": "", "keep_open": True}]}
+
+    @staticmethod
+    def notice(title, subtitle=None, icon="dialog-information"):
+        return {"title": title, "subtitle": subtitle, "icon": icon, "sticky": True, "keep_open": True, "id": "notice"}
+
+    # views
+    def home(self, text):
+        if ">" in text:
+            return self.typed_route(text)
+        words = fold(text).split()
+        hit = lambda name: all(w in fold(name) for w in words)
+        items = [self.route_item(r) for r in self.store.routes if hit(f"{r['from']['name']} {r['to']['name']}")]
+        favorites = [s for s in self.store.stations if hit(s["name"])]
+        items += [self.favorite_item(s) for s in favorites]
+        if not text.strip():
+            return items or [self.notice("Type a station to get started",
+                                         "Tab on a station adds a favorite. Tab on a connection bookmarks the route.")]
+        known = {s["id"] for s in favorites}
+        shown = lambda sid: self.saved(sid) in known
+        found = self.stations(text)
+        if isinstance(found, dict):
+            return items + [self.notice("Can't reach Transitous", found["error"], "dialog-error")]
+        for s in found or []:
+            if not shown(s["id"]):
+                items.append({"id": self.to_dest(s["id"]), "title": s["name"], "subtitle": s["area"],
+                              "icon": ICON, "verb": "From here", "keep_open": True,
+                              "actions": self.station_actions(s["id"], "dest")})
+        if not items:
+            return [self.notice("Searching…" if found is None else "No station found")]
+        return items
+
+    def typed_route(self, text):
+        left, _, right = text.partition(">")
+        origin = self.stations(left)
+        if isinstance(origin, dict):
+            return [self.notice("Can't reach Transitous", origin["error"], "dialog-error")]
+        if not origin:
+            return [self.notice("Searching…" if origin is None and left.strip() else "No start station found")]
+        return self.destinations(origin[0]["id"], right)
+
+    def destinations(self, a, text):
+        place, when = split_when(text)
+        rows = []
+        words = fold(place).split()
+        for s in self.store.stations:
+            if s["id"] != a and all(w in fold(s["name"]) for w in words):
+                rows.append({"id": self.to_trip(a, s["id"], when), "title": s["name"], "subtitle": "Favorite",
+                             "icon": "text:⭐", "verb": "Connections", "keep_open": True})
+        if len(place) >= 2:
+            known = {s["id"] for s in self.store.stations}
+            found = self.stations(place)
+            if isinstance(found, dict):
+                return rows + [self.notice("Can't reach Transitous", found["error"], "dialog-error")]
+            for s in found or []:
+                if s["id"] != a and self.saved(s["id"]) not in known:
+                    rows.append({"id": self.to_trip(a, s["id"], when), "title": s["name"], "subtitle": s["area"],
+                                 "icon": ICON, "verb": "Connections", "keep_open": True})
+            if not rows:
+                return [self.notice("Searching…" if found is None else "No station found")]
+        return rows or [self.notice(f"Where to from {self.name(a)}?", "Add a time if you like: Berlin morgen 8")]
+
+    def departures_view(self, sid):
+        got = self.board(sid)
+        if got is None:
+            return [self.notice("Loading departures…")]
+        if isinstance(got, dict):
+            return [self.notice("Can't load departures", got["error"], "dialog-error")]
+        now = dt.datetime.now(TZ) - dt.timedelta(minutes=1)
+        items = []
+        for s in got:
+            p = s["place"]
+            when = p.get("departure")
+            if not when or stamp(when) < now:
+                continue
+            gone = s.get("cancelled") or s.get("tripCancelled") or p.get("cancelled")
+            line = s.get("displayName") or s.get("routeShortName") or "Train"
+            sub = [until(when)]
+            if p.get("track"):
+                moved = p.get("scheduledTrack") and p["scheduledTrack"] != p["track"]
+                sub.append(f"Gl. {p['track']}" + (f" (statt {p['scheduledTrack']})" if moved else ""))
+            if s.get("agencyName"):
+                sub.append(s["agencyName"])
+            items.append({"id": f"d:{s.get('tripId')}:{when}", "title": f"{clock(when)}  {line} → {s.get('headsign')}",
+                          "subtitle": " · ".join(sub), "icon": icon_for(s.get("mode")),
+                          "badge": "cancelled" if gone else late(delay(when, p.get("scheduledDeparture"))),
+                          "keywords": [line, s.get("routeShortName") or "", p.get("track") or ""],
+                          "keep_open": True, "verb": "Departure",
+                          "actions": self.station_actions(sid, "dep")})
+        return items or [self.notice("No departures soon")]
+
+    def trip_view(self, a, b, rest):
+        when = parse_when(rest) if rest.strip() else None
+        if rest.strip() and not when:
+            return [self.notice("Type a time", "18:30 · morgen 8 · fr 18:00 · 24.12. 9")]
+        got = self.plan(a, b, when)
+        if got is None:
+            return [self.notice("Finding connections…")]
+        if "error" in got:
+            return [self.notice("Can't load connections", got["error"], "dialog-error")]
+        items = []
+        for it in got["items"]:
+            token = trip_token(it)
+            self.trips[token] = (a, b, it)
+            first = next((l for l in it["legs"] if l.get("mode") != "WALK"), None)
+            d = delay(first["startTime"], first.get("scheduledStartTime")) if first else 0
+            items.append({"id": self.nav(f"legs:{token}{SEP}", f"{self.name(a)} → {self.name(b)}"),
+                          "title": summary(it), "subtitle": f"{lines(it)} · {transfers(it)}{track_note(first)}",
+                          "icon": icon_for(first.get("mode") if first else None),
+                          "badge": "cancelled" if cancelled(it) else late(d), "verb": "Details", "keep_open": True,
+                          "actions": self.trip_actions(a, b, it)})
+        if not items:
+            return [self.notice("No connections found")]
+        return items
+
+    def trip_actions(self, a, b, it):
+        saved = self.store.is_route(self.saved(a), self.saved(b))
+        return [{"title": "Remove bookmark" if saved else "Bookmark route", "id": self.cmd("route", a, b),
+                 "icon": "text:🔖", "subtitle": "", "keep_open": True},
+                {"title": "Reverse route", "id": self.to_trip(b, a), "icon": "text:🔁", "subtitle": "",
+                 "keep_open": True},
+                {"title": "Open on bahn.de", "id": self.cmd("web", a, b, trip_token(it)), "icon": "text:🌐",
+                 "subtitle": "Prices and booking"},
+                {"title": "Copy", "id": self.cmd("copy", a, b, trip_token(it)), "icon": "edit-copy", "subtitle": ""}]
+
+    def legs_view(self, token):
+        got = self.trips.get(token)
+        if not got:
+            return [self.notice("That connection is gone")]
+        a, b, it = got
+        actions = self.trip_actions(a, b, it)
+        items, last = [], None
+        for n, l in enumerate(x for x in it["legs"] if x.get("mode") != "WALK"):
+            if last:
+                wait = (stamp(l["startTime"]) - stamp(last["endTime"])).total_seconds()
+                items.append({"id": f"c:{n}", "title": f"Change at {last['to']['name']}",
+                              "subtitle": f"{span(wait)} to change", "icon": "text:🚶", "keep_open": True,
+                              "actions": actions})
+            dep, arr = delay(l["startTime"], l.get("scheduledStartTime")), delay(l["endTime"], l.get("scheduledEndTime"))
+            tracks = [f"Gl. {x}" if x else "" for x in (l["from"].get("track"), l["to"].get("track"))]
+            note = " → ".join(t for t in tracks if t)
+            items.append({"id": f"l:{n}",
+                          "title": f"{clock(l['startTime'])} {l['from']['name']} → {clock(l['endTime'])} {l['to']['name']}",
+                          "subtitle": " · ".join(x for x in (f"{l.get('displayName') or 'Train'} to {l.get('headsign')}",
+                                                             note, span(l.get("duration") or 0)) if x),
+                          "icon": icon_for(l.get("mode")),
+                          "badge": "cancelled" if l.get("cancelled") else late(max(dep, arr)), "keep_open": True,
+                          "actions": actions})
+            last = l
+        return items
+
+    def view(self, q):
+        kind, _, tail = q.partition(":")
+        if kind in ("dep", "to", "trip", "legs") and SEP in tail:
+            head, rest = tail.split(SEP, 1)
+            if kind == "dep":
+                return f"dep:{head}{SEP}", self.name(head), False, f"Filter {self.name(head)}…", \
+                    lambda: self.departures_view(head)
+            if kind == "to":
+                return f"to:{head}{SEP}", f"{self.name(head)} →", True, "To which station?", \
+                    lambda: self.destinations(head, rest)
+            if kind == "trip" and "|" in head:
+                a, b = head.split("|", 1)
+                return f"trip:{head}{SEP}", f"{self.name(a)} → {self.name(b)}", True, \
+                    "When? 18:30 · morgen 8 · fr 18:00", lambda: self.trip_view(a, b, rest)
+            if kind == "legs":
+                trip = self.trips.get(head)
+                label = f"{self.name(trip[0])} → {self.name(trip[1])}" if trip else "Connection"
+                return f"legs:{head}{SEP}", label, False, "Filter this trip…", lambda: self.legs_view(head)
+        return None, None, True, "Station, or Köln > Berlin morgen 8", lambda: self.home(q)
+
+    def render(self):
+        with self.lock:
+            if self.query is None:
+                return
+            match, label, live, placeholder, build = self.view(self.query)
+            scope = {"match": match, "label": label} if match else None
+            if scope != self.scope:
+                self.scope = scope
+                self.emit({"scope": scope})
+            if live != self.live:
+                self.live = live
+                self.emit({"live": live})
+            if placeholder != self.placeholder:
+                self.placeholder = placeholder
+                self.emit({"placeholder": placeholder})
+            items = [{k: v for k, v in i.items() if v is not None} for i in build()]
+            if items != self.shown:
+                self.shown = items
+                self.emit({"items": items})
+
+    # activations
+    def activate(self, iid, action):
+        try:
+            c = json.loads(action or iid or "")
+        except ValueError:
+            return
+        if not isinstance(c, list) or not c:
+            return
+        if c[0] == "go":
+            scope = {"match": c[1].split(SEP)[0] + SEP, "label": c[2]} if c[2] else None
+            with self.lock:
+                self.scope = scope
+                self.emit({"scope": scope}, {"set_query": c[1]})
+        elif c[0] == "fav":
+            sid = self.stabilize(c[1])
+            self.store.toggle_station(sid, self.name(c[1]))
+            self.render()
+        elif c[0] == "route":
+            a, b = self.stabilize(c[1]), self.stabilize(c[2])
+            self.store.toggle_route(a, self.name(c[1]), b, self.name(c[2]))
+            self.render()
+        elif c[0] == "web":
+            trip = self.trips.get(c[3])
+            if not trip:
+                return
+            subprocess.Popen(["xdg-open", bahn_url(self.name(c[1]), self.name(c[2]), trip[2])],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        elif c[0] == "copy":
+            trip = self.trips.get(c[3])
+            if trip:
+                copy(describe(trip[2]))
+
+    def run(self):
+        self.emit({"activations": True, "live": True, "prompt": "bahn"})
+        self.live = True
+        # Nothing is fetched until the first query: doit only sends one when
+        # this mode is actually in use.
+        for line in sys.stdin:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if "activate" in msg:
+                a = msg["activate"]
+                self.activate(a.get("id"), a.get("action"))
+            else:
+                with self.lock:
+                    self.query = msg.get("query", "")
+                self.render()
+
+
+# ── connection text ──────────────────────────────────────────────────────────
+
+def trip_token(it):
+    return it.get("id") or f"{it['startTime']}{it['endTime']}"
+
+
+def rides(it):
+    return [l for l in it["legs"] if l.get("mode") != "WALK"]
+
+
+def cancelled(it):
+    return any(l.get("cancelled") for l in rides(it))
+
+
+def summary(it):
+    return f"{clock(it['startTime'])} → {clock(it['endTime'])} · {span(it.get('duration') or 0)}"
+
+
+def lines(it):
+    return " › ".join(l.get("displayName") or l.get("routeShortName") or "Train" for l in rides(it)) or "On foot"
+
+
+def transfers(it):
+    n = max(len(rides(it)) - 1, 0)
+    return "direct" if n == 0 else f"{n} change" + ("s" if n > 1 else "")
+
+
+def track_note(leg):
+    track = leg and leg["from"].get("track")
+    return f" · Gl. {track}" if track else ""
+
+
+def describe(it):
+    out = [f"{stamp(it['startTime']):%a %d.%m.} {summary(it)}"]
+    for l in rides(it):
+        out.append(f"{clock(l['startTime'])} {l['from']['name']} → {clock(l['endTime'])} {l['to']['name']} "
+                   f"({l.get('displayName') or 'Train'})")
+    return "\n".join(out)
+
+
+def bahn_url(origin, target, it):
+    """A bahn.de search. Station names differ between the two systems, so the
+    places are given by coordinates, which bahn.de resolves to its own stations."""
+    def place(name, stop):
+        return f"A=2@O={name}@X={round(stop['lon'] * 1e6)}@Y={round(stop['lat'] * 1e6)}@"
+
+    legs = rides(it) or it["legs"]
+    frag = urllib.parse.urlencode({
+        "sts": "true", "so": origin, "zo": target, "soid": place(origin, legs[0]["from"]),
+        "zoid": place(target, legs[-1]["to"]), "kl": "2",
+        "hd": stamp(it["startTime"]).strftime("%Y-%m-%dT%H:%M:%S"), "hza": "D", "ar": "false", "s": "true", "d": "false",
+        "hz": "[]", "fm": "false", "bp": "false"}, quote_via=urllib.parse.quote)
+    return f"https://www.bahn.de/buchung/fahrplan/suche#{frag}"
+
+
+def copy(text):
+    try:
+        subprocess.run(["wl-copy"], input=text.encode(), check=False, timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def main():
+    if sys.argv[1:2] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return
+    try:
+        Provider().run()
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
+
+
+if __name__ == "__main__":
+    main()

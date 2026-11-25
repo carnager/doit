@@ -67,6 +67,16 @@ exec = "jot"
 prefix = "j "
 
 [[provider]]
+name = "bahn"
+exec = "bahn"
+prefix = "b "
+
+[[provider]]
+name = "weather"
+exec = "weather"            # "weather --imperial" for °F, mph and inches
+prefix = "wx "
+
+[[provider]]
 name = "emoji"
 exec = "emoji"
 prefix = ":"

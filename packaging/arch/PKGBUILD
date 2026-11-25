@@ -8,9 +8,9 @@ url='https://github.com/carnager/doit'
 license=(MIT)
 depends=(gcc-libs glibc libxkbcommon)
 makedepends=(cargo git)
-optdepends=('python: the bundled providers (calc, emoji, niri windows, melody, popcorn, jot)'
+optdepends=('python: the bundled providers (calc, emoji, niri windows, melody, popcorn, jot, bahn, weather)'
             'wtype: emoji types into the focused window'
-            'wl-clipboard: copying from calc, emoji and jot'
+            'wl-clipboard: copying from calc, emoji, jot, bahn and weather'
             'noto-fonts-emoji: color emoji'
             'mpv: popcorn playback')
 provides=(doit)

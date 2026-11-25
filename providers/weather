@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""doit mode for the weather, from the open Open-Meteo API (no key needed).
+
+  empty query           favorite places with the weather right now
+  a place               search; Enter shows its forecast
+  in a forecast         now, the next hours, then ten days; Enter on a day
+                        shows it hour by hour
+
+  Tab                   add or remove a favorite, copy, open the map on Windy
+
+  weather --imperial    °F, mph and inches
+
+Favorites live in ~/.local/share/doit/weather.json, the first one on top.
+
+  [[provider]]
+  name = "weather"
+  exec = "weather"
+  prefix = "wx "
+"""
+
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+
+FORECAST = "https://api.open-meteo.com/v1/forecast"
+GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
+AGENT = "doit-weather-provider"
+HOME = os.path.expanduser("~")
+STORE = os.path.join(os.environ.get("XDG_DATA_HOME") or f"{HOME}/.local/share", "doit", "weather.json")
+SEP = " › "
+IMPERIAL = "--imperial" in sys.argv[1:]
+WIND = "mph" if IMPERIAL else "km/h"
+RAIN = "in" if IMPERIAL else "mm"
+LANG = (os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or "en")[:2].lower()
+if not LANG.isalpha():
+    LANG = "en"
+requests = threading.BoundedSemaphore(4)
+
+CURRENT = "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m," \
+          "wind_direction_10m,wind_gusts_10m,precipitation,is_day"
+HOURLY = "temperature_2m,apparent_temperature,precipitation_probability,precipitation,weather_code," \
+         "wind_speed_10m,wind_direction_10m,is_day"
+DAILY = "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max," \
+        "wind_speed_10m_max,wind_gusts_10m_max,sunrise,sunset,uv_index_max"
+
+# WMO weather codes: (text, day glyph, night glyph)
+CODES = {
+    0: ("Clear", "☀️", "🌙"), 1: ("Mostly clear", "🌤️", "🌙"), 2: ("Partly cloudy", "⛅", "☁️"),
+    3: ("Overcast", "☁️", "☁️"), 45: ("Fog", "🌫️", "🌫️"), 48: ("Freezing fog", "🌫️", "🌫️"),
+    51: ("Light drizzle", "🌦️", "🌧️"), 53: ("Drizzle", "🌦️", "🌧️"), 55: ("Heavy drizzle", "🌧️", "🌧️"),
+    56: ("Freezing drizzle", "🌧️", "🌧️"), 57: ("Freezing drizzle", "🌧️", "🌧️"),
+    61: ("Light rain", "🌦️", "🌧️"), 63: ("Rain", "🌧️", "🌧️"), 65: ("Heavy rain", "🌧️", "🌧️"),
+    66: ("Freezing rain", "🌧️", "🌧️"), 67: ("Heavy freezing rain", "🌧️", "🌧️"),
+    71: ("Light snow", "🌨️", "🌨️"), 73: ("Snow", "🌨️", "🌨️"), 75: ("Heavy snow", "❄️", "❄️"),
+    77: ("Snow grains", "🌨️", "🌨️"), 80: ("Light showers", "🌦️", "🌧️"), 81: ("Showers", "🌧️", "🌧️"),
+    82: ("Violent showers", "🌧️", "🌧️"), 85: ("Snow showers", "🌨️", "🌨️"), 86: ("Heavy snow showers", "❄️", "❄️"),
+    95: ("Thunderstorm", "⛈️", "⛈️"), 96: ("Thunderstorm, hail", "⛈️", "⛈️"), 99: ("Thunderstorm, hail", "⛈️", "⛈️"),
+}
+COMPASS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+
+
+# ── api ──────────────────────────────────────────────────────────────────────
+
+def get(url, **params):
+    query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+    req = urllib.request.Request(f"{url}?{query}", headers={"User-Agent": AGENT, "Accept": "application/json"})
+    with requests, urllib.request.urlopen(req, timeout=20) as r:
+        return json.load(r)
+
+
+def search_places(text):
+    out = get(GEOCODE, name=text, count=12, language=LANG, format="json").get("results") or []
+    seen, places = set(), []
+    for p in out:
+        place = {"name": p["name"], "lat": round(p["latitude"], 3), "lon": round(p["longitude"], 3),
+                 "area": ", ".join(x for x in (p.get("admin1"), p.get("country")) if x and x != p["name"])}
+        if key(place) not in seen:
+            seen.add(key(place))
+            places.append(place)
+    return places
+
+
+def forecast(place):
+    units = {"temperature_unit": "fahrenheit", "wind_speed_unit": "mph",
+             "precipitation_unit": "inch"} if IMPERIAL else {}
+    return get(FORECAST, latitude=place["lat"], longitude=place["lon"], current=CURRENT, hourly=HOURLY,
+               daily=DAILY, timezone="auto", forecast_days=10, **units)
+
+
+def key(place):
+    return f"{place['lat']},{place['lon']}"
+
+
+def fold(text):
+    text = text.casefold().replace("ß", "ss")
+    text = "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
+    return re.sub(r"[^\w]+", " ", text).strip()
+
+
+# ── text ─────────────────────────────────────────────────────────────────────
+
+def sky(code, day=True):
+    text, sun, moon = CODES.get(code, ("Unknown", "🌡️", "🌡️"))
+    return text, "text:" + (sun if day else moon)
+
+
+def deg(t):
+    return f"{round(t)}°" if t is not None else "–"
+
+
+def compass(d):
+    return COMPASS[round(d / 45) % 8] if d is not None else ""
+
+
+def wind(speed, direction=None):
+    if speed is None:
+        return None
+    return f"wind {round(speed)} {WIND}" + (f" {compass(direction)}" if direction is not None else "")
+
+
+def rain(chance=None, amount=None):
+    bits = []
+    if chance:
+        bits.append(f"{chance}%")
+    if amount and amount >= (0.01 if IMPERIAL else 0.1):
+        bits.append(f"{amount:.2f} {RAIN}" if IMPERIAL else f"{amount:.1f} {RAIN}")
+    return "rain " + ", ".join(bits) if bits else None
+
+
+def join(*bits):
+    return " · ".join(b for b in bits if b)
+
+
+def day_name(iso, today):
+    d = dt.date.fromisoformat(iso)
+    if d == today:
+        return "Today"
+    if d == today + dt.timedelta(days=1):
+        return "Tomorrow"
+    return f"{d:%a %d %b}"
+
+
+def hours(f, date=None, limit=None):
+    """Hourly rows as dicts, from the current hour on (or for one day)."""
+    h = f["hourly"]
+    now = f["current"]["time"][:13]
+    out = []
+    for i, t in enumerate(h["time"]):
+        if t[:13] < now or (date and not t.startswith(date)):
+            continue
+        out.append({k: h[k][i] for k in h})
+        if limit and len(out) == limit:
+            break
+    return out
+
+
+def days(f):
+    d = f["daily"]
+    return [{k: d[k][i] for k in d} for i in range(len(d["time"]))]
+
+
+def outlook(f):
+    """'15h 8° · 16h 7° 🌧️ · …' for the next hours."""
+    out = []
+    for h in hours(f, limit=13)[1::3]:
+        _, glyph = sky(h["weather_code"], h["is_day"])
+        out.append(f"{h['time'][11:13]}h {glyph[5:]} {deg(h['temperature_2m'])}")
+    return "  ".join(out)
+
+
+def describe(place, f):
+    c = f["current"]
+    text, _ = sky(c["weather_code"], c["is_day"])
+    lines = [f"{place['name']}: {deg(c['temperature_2m'])}, {text}, feels {deg(c['apparent_temperature'])}, "
+             f"{wind(c['wind_speed_10m'], c['wind_direction_10m'])}"]
+    today = dt.date.fromisoformat(f["current"]["time"][:10])
+    for d in days(f)[:5]:
+        text, _ = sky(d["weather_code"])
+        lines.append(f"{day_name(d['time'], today)}: {deg(d['temperature_2m_max'])} / "
+                     f"{deg(d['temperature_2m_min'])}, {join(text, rain(d['precipitation_probability_max']))}")
+    return "\n".join(lines)
+
+
+# ── favorites ────────────────────────────────────────────────────────────────
+
+class Store:
+    def __init__(self):
+        try:
+            with open(STORE) as fh:
+                self.places = json.load(fh).get("places") or []
+        except (OSError, ValueError, AttributeError):
+            self.places = []
+
+    def save(self):
+        os.makedirs(os.path.dirname(STORE), exist_ok=True)
+        tmp = STORE + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump({"places": self.places}, fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, STORE)
+
+    def has(self, k):
+        return any(key(p) == k for p in self.places)
+
+    def toggle(self, place):
+        if self.has(key(place)):
+            self.places = [p for p in self.places if key(p) != key(place)]
+        else:
+            self.places.append(place)
+        self.save()
+
+
+# ── the mode ─────────────────────────────────────────────────────────────────
+
+class Provider:
+    def __init__(self):
+        self.store = Store()
+        self.lock = threading.RLock()
+        self.cache = {}  # key -> (fetched at, value)
+        self.loading = set()
+        self.places = {key(p): p for p in self.store.places}
+        self.query = None
+        self.scope = self.live = self.placeholder = self.shown = False
+
+    @staticmethod
+    def emit(*objs):
+        for o in objs:
+            sys.stdout.write(json.dumps(o, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+    # data: return what we have, fetch in the background, redraw when it lands
+    def want(self, k, ttl, fetch, wait=0):
+        with self.lock:
+            hit = self.cache.get(k)
+            if hit and time.time() - hit[0] < ttl:
+                return hit[1]
+            if k not in self.loading:
+                self.loading.add(k)
+                threading.Thread(target=self.load, args=(k, fetch, wait), daemon=True).start()
+            return hit[1] if hit else None
+
+    def load(self, k, fetch, wait):
+        if wait:
+            time.sleep(wait)  # typing: only ask for what's still on screen
+            with self.lock:
+                if k[1] not in (self.query or ""):
+                    self.loading.discard(k)
+                    return
+        try:
+            value = fetch()
+        except (urllib.error.URLError, OSError, ValueError, KeyError) as e:
+            value = {"error": str(getattr(e, "reason", e))}
+        with self.lock:
+            self.cache[k] = (time.time(), value)
+            self.loading.discard(k)
+            try:
+                self.render()
+            except BrokenPipeError:
+                os._exit(0)
+
+    def search(self, text):
+        text = text.strip()
+        if len(text) < 2:
+            return []
+        found = self.want(("geo", text), 86400, lambda: search_places(text), wait=0.15)
+        if isinstance(found, list):
+            for p in found:
+                self.places.setdefault(key(p), p)
+        return found
+
+    def weather(self, k):
+        place = self.places.get(k)
+        if not place:
+            return {"error": "Unknown place"}
+        return self.want(("wx", k), 600, lambda: forecast(place))
+
+    # commands travel as item and action ids
+    @staticmethod
+    def cmd(*parts):
+        return json.dumps(parts, ensure_ascii=False)
+
+    def nav(self, q, label):
+        return self.cmd("go", q, label)
+
+    def name(self, k):
+        return self.places.get(k, {}).get("name", "Place")
+
+    def cached(self, k):
+        """The forecast we already have for a place, without fetching."""
+        f = self.cache.get(("wx", k), (0, None))[1]
+        return f if isinstance(f, dict) and "current" in f else None
+
+    def to_place(self, k):
+        return self.nav(f"at:{k}{SEP}", self.name(k))
+
+    def to_day(self, k, date, label):
+        return self.nav(f"day:{k}|{date}{SEP}", f"{self.name(k)} · {label}")
+
+    def actions(self, k):
+        fav = self.store.has(k)
+        acts = [{"title": "Remove from favorites" if fav else "Add to favorites", "id": self.cmd("fav", k),
+                 "icon": "text:⭐", "subtitle": "", "keep_open": True}]
+        if self.cached(k):
+            acts.append({"title": "Copy", "id": self.cmd("copy", k), "icon": "edit-copy", "subtitle": ""})
+        acts.append({"title": "Open on Windy", "id": self.cmd("web", k), "icon": "text:🌐",
+                     "subtitle": "Radar and maps"})
+        return acts
+
+    @staticmethod
+    def notice(title, subtitle=None, icon="dialog-information"):
+        return {"title": title, "subtitle": subtitle, "icon": icon, "sticky": True, "keep_open": True, "id": "notice"}
+
+    def place_item(self, p, verb="Forecast"):
+        k = key(p)
+        item = {"id": self.to_place(k), "title": p["name"], "subtitle": p.get("area") or None,
+                "icon": "text:📍", "verb": verb, "keep_open": True, "actions": self.actions(k)}
+        f = self.weather(k) if self.store.has(k) else self.cached(k)
+        if f is None and self.store.has(k):
+            item["subtitle"] = "Loading…"
+        elif isinstance(f, dict) and "current" in f:
+            c, today = f["current"], days(f)[0]
+            text, item["icon"] = sky(c["weather_code"], c["is_day"])
+            item["badge"] = deg(c["temperature_2m"])
+            item["subtitle"] = join(text, f"{deg(today['temperature_2m_max'])} / {deg(today['temperature_2m_min'])}",
+                                    rain(today["precipitation_probability_max"]), p.get("area"))
+        elif isinstance(f, dict):
+            item["subtitle"] = "Weather unavailable"
+        return item
+
+    # views
+    def home(self, text):
+        words = fold(text).split()
+        favorites = [p for p in self.store.places if all(w in fold(f"{p['name']} {p.get('area', '')}") for w in words)]
+        items = [self.place_item(p) for p in favorites]
+        if not text.strip():
+            return items or [self.notice("Type a place to get started", "Tab on a place adds it to your favorites.")]
+        found = self.search(text)
+        if isinstance(found, dict):
+            return items + [self.notice("Can't reach Open-Meteo", found["error"], "dialog-error")]
+        known = {key(p) for p in favorites}
+        items += [self.place_item(p) for p in found or [] if key(p) not in known]
+        if not items:
+            return [self.notice("Searching…" if found is None else "No place found")]
+        return items
+
+    def place_view(self, k):
+        f = self.weather(k)
+        if f is None:
+            return [self.notice("Loading the forecast…")]
+        if "error" in f:
+            return [self.notice("Can't load the forecast", f["error"], "dialog-error")]
+        acts = self.actions(k)
+        c = f["current"]
+        text, icon = sky(c["weather_code"], c["is_day"])
+        today = dt.date.fromisoformat(c["time"][:10])
+        items = [{"id": self.to_day(k, c["time"][:10], "Today"), "title": f"Now · {text}", "icon": icon,
+                  "badge": deg(c["temperature_2m"]), "verb": "Hours", "keep_open": True, "actions": acts,
+                  "subtitle": join(f"feels {deg(c['apparent_temperature'])}",
+                                   wind(c["wind_speed_10m"], c["wind_direction_10m"]),
+                                   f"gusts {round(c['wind_gusts_10m'])}" if c.get("wind_gusts_10m") else None,
+                                   f"humidity {c['relative_humidity_2m']}%")},
+                 {"id": self.to_day(k, c["time"][:10], "Today"), "title": "Next hours", "icon": "text:🕒",
+                  "subtitle": outlook(f), "verb": "Hours", "keep_open": True, "actions": acts}]
+        for d in days(f):
+            text, icon = sky(d["weather_code"])
+            label = day_name(d["time"], today)
+            sun = f"☀ {d['sunrise'][11:16]}–{d['sunset'][11:16]}" if d.get("sunrise") else None
+            items.append({"id": self.to_day(k, d["time"], label), "title": f"{label} · {text}", "icon": icon,
+                          "badge": f"{deg(d['temperature_2m_max'])} / {deg(d['temperature_2m_min'])}",
+                          "subtitle": join(rain(d["precipitation_probability_max"], d["precipitation_sum"]),
+                                           wind(d["wind_speed_10m_max"]),
+                                           f"UV {round(d['uv_index_max'])}" if d.get("uv_index_max") else None, sun),
+                          "keywords": [d["time"], f"{dt.date.fromisoformat(d['time']):%A}"],
+                          "verb": "Hours", "keep_open": True, "actions": acts})
+        return items
+
+    def day_view(self, k, date):
+        f = self.weather(k)
+        if f is None:
+            return [self.notice("Loading the forecast…")]
+        if "error" in f:
+            return [self.notice("Can't load the forecast", f["error"], "dialog-error")]
+        acts = self.actions(k)
+        items = []
+        for h in hours(f, date=date):
+            text, icon = sky(h["weather_code"], h["is_day"])
+            items.append({"id": f"h:{h['time']}", "title": f"{h['time'][11:16]}  {text}", "icon": icon,
+                          "badge": deg(h["temperature_2m"]), "keep_open": True, "actions": acts,
+                          "subtitle": join(f"feels {deg(h['apparent_temperature'])}",
+                                           rain(h["precipitation_probability"], h["precipitation"]),
+                                           wind(h["wind_speed_10m"], h["wind_direction_10m"]))})
+        return items or [self.notice("No hours left for that day")]
+
+    def view(self, q):
+        kind, _, tail = q.partition(":")
+        if kind in ("at", "day") and SEP in tail:
+            head = tail.split(SEP, 1)[0]
+            if kind == "at":
+                return f"at:{head}{SEP}", self.name(head), False, f"Filter {self.name(head)}…", \
+                    lambda: self.place_view(head)
+            if "|" in head:
+                k, date = head.split("|", 1)
+                f = self.cached(k)
+                today = dt.date.fromisoformat(f["current"]["time"][:10]) if f else dt.date.today()
+                label = day_name(date, today)
+                return f"day:{head}{SEP}", f"{self.name(k)} · {label}", False, "Filter the hours…", \
+                    lambda: self.day_view(k, date)
+        return None, None, True, "A place: Berlin, Paris, Tokyo…", lambda: self.home(q)
+
+    def render(self):
+        with self.lock:
+            if self.query is None:
+                return
+            match, label, live, placeholder, build = self.view(self.query)
+            scope = {"match": match, "label": label} if match else None
+            if scope != self.scope:
+                self.scope = scope
+                self.emit({"scope": scope})
+            if live != self.live:
+                self.live = live
+                self.emit({"live": live})
+            if placeholder != self.placeholder:
+                self.placeholder = placeholder
+                self.emit({"placeholder": placeholder})
+            items = [{k: v for k, v in i.items() if v is not None} for i in build()]
+            if items != self.shown:
+                self.shown = items
+                self.emit({"items": items})
+
+    # activations
+    def activate(self, iid, action):
+        try:
+            c = json.loads(action or iid or "")
+        except ValueError:
+            return
+        if not isinstance(c, list) or not c:
+            return
+        if c[0] == "go":
+            scope = {"match": c[1].split(SEP)[0] + SEP, "label": c[2]} if c[2] else None
+            with self.lock:
+                self.scope = scope
+                self.emit({"scope": scope}, {"set_query": c[1]})
+        elif c[0] == "fav" and c[1] in self.places:
+            self.store.toggle(self.places[c[1]])
+            self.render()
+        elif c[0] == "copy":
+            f = self.cached(c[1])
+            if f:
+                copy(describe(self.places[c[1]], f))
+        elif c[0] == "web" and c[1] in self.places:
+            p = self.places[c[1]]
+            subprocess.Popen(["xdg-open", f"https://www.windy.com/?{p['lat']},{p['lon']},9"],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+
+    def run(self):
+        self.emit({"activations": True, "live": True, "prompt": "weather"})
+        self.live = True
+        # Nothing is fetched until the first query: doit only sends one when
+        # this mode is actually in use.
+        for line in sys.stdin:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if "activate" in msg:
+                a = msg["activate"]
+                self.activate(a.get("id"), a.get("action"))
+            else:
+                with self.lock:
+                    self.query = msg.get("query", "")
+                self.render()
+
+
+def copy(text):
+    try:
+        subprocess.run(["wl-copy"], input=text.encode(), check=False, timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def main():
+    if sys.argv[1:2] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return
+    try:
+        Provider().run()
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
+
+
+if __name__ == "__main__":
+    main()

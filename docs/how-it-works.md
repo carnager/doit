@@ -177,7 +177,7 @@ Static providers can just print items and exit. Live providers set
 does the matching.
 
 Examples in [`providers/`](../providers): `calc` (live), `niri-windows` (live, Alt+Tab), `power`,
-`emoji`, `melody`, `popcorn` and `jot`.
+`emoji`, `melody`, `popcorn`, `jot`, `bahn` and `weather`.
 
 ### niri-windows
 
@@ -290,6 +290,39 @@ Notes and todos from a [Jot](https://github.com/carnager/jot) server. Prefix
 Everything is cached (mode 600) under `~/.cache/doit/jot`, so it opens
 instantly and captures offline. Changes reach the server as soon as it
 answers, and changes made elsewhere show up while it's open.
+
+### bahn
+
+Train connections and departures from the open
+[Transitous](https://transitous.org) API. Prefix `b `:
+
+- **empty query:** bookmarked routes with their next connection, then favorite
+  stations with their next departures.
+- **a station:** Enter picks it as the start, then type the destination. Or
+  type it all at once: `Köln > Berlin morgen 8`.
+- **connections:** type a time to move the search (`18:30`, `morgen 8`,
+  `fr 18:00`, `24.12. 9`). Enter shows the legs, platforms and changes.
+- **Tab:** add or remove a favorite, bookmark or reverse a route, see
+  departures, copy a trip, or open it on bahn.de for prices and booking.
+
+Delays and platform changes appear where Transitous has live data, which is not
+every train. Favorites and bookmarks are kept in `~/.local/share/doit/bahn.json`.
+
+### weather
+
+Forecasts from the open [Open-Meteo](https://open-meteo.com) API, no key
+needed. Prefix `wx `:
+
+- **empty query:** favorite places with the temperature right now, the
+  conditions and today's high and low.
+- **a place:** search in your language; Enter shows its forecast: now, the next
+  hours, then ten days with rain, wind, UV and daylight. Enter on a day shows
+  it hour by hour.
+- **Tab:** add or remove a favorite, copy the forecast, or open the place on
+  Windy for radar and maps.
+
+`weather --imperial` switches to °F, mph and inches. Favorites are kept in
+`~/.local/share/doit/weather.json`.
 
 ## Configuration
 
